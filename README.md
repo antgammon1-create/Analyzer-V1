@@ -1,112 +1,89 @@
-# EDGE v3 — Complete MLB Research Platform
+# EDGE v4 — Walk-Forward Validation Lab
 
-This is the largest EDGE build so far. It turns the live prototype into a research platform that can be tested rather than merely inspected.
+This build implements the validation methodology requested after the first backtest.
 
-## What is included
+## Core upgrade
 
-### Live MLB engine
-- MLB schedule
-- probable pitchers
-- leakage-aware team and pitcher stats
-- venue data
-- first-pitch weather
-- weather sanity checks
-- lineup confirmation detection
-- team pitching / bullpen proxy
-- Monte Carlo simulations
-- moneyline
-- totals
-- run lines
-- no-vig consensus market probability
-- best available price
-- fair price
-- EV
-- Edge Score
-- reliability label
-- model-market disagreement penalty
-- run-projection explanation
-- downloadable live-board CSV
+Instead of evaluating/calibrating on one sample, v4 uses:
 
-### Historical backtesting
-- user-selectable historical windows up to 45 days per run
-- stats are pulled only through the day BEFORE each game
-- historical weather is omitted to prevent forecast look-ahead
+**Train -> calibrate -> freeze -> test on unseen games -> walk forward**
+
+This is designed to reduce overfitting and provide a much more honest estimate of model quality.
+
+## Included
+
+### Historical dataset builder
+- completed MLB games
+- pre-game team and pitcher stats only
+- stats stop on the day before each game
+- raw model probability
+- optional historical sportsbook odds
+
+### Walk-forward testing
+User controls:
+- training-window size
+- test-window size
+- walk step
+- optional probability calibration
+
+For every unseen test window:
+- fit model only on prior training data
+- optionally calibrate only on training data
+- freeze the model
+- predict the next unseen window
+- advance forward
+
+### Evaluation
 - Brier score
 - log loss
 - classification accuracy
-- probability-band calibration table
-- downloadable backtest CSV
+- probability-band calibration
+- window-by-window stability
 
-### Historical odds / ROI
-Optional:
-- attempts The Odds API historical endpoint
-- requires an account/API plan that supports historical odds
-- flat-stake ROI by user-defined edge threshold
+### Market comparison
+If historical odds are available:
+- no-vig market benchmark
+- EDGE Brier vs sportsbook Brier
+- EDGE log loss vs sportsbook log loss
+- flat-stake ROI by minimum edge threshold
+- sample-size reporting
 
-If the historical endpoint is not available on the user's API plan, the prediction backtest still works without ROI.
+### Exports
+- dataset CSV
+- walk-forward predictions CSV
+- validation summary JSON
 
-### Probability calibration
-- logistic/Platt-style calibration fitted from a completed backtest
-- compares raw vs calibrated Brier score
-- can activate calibrated probabilities for the current Streamlit session
-- calibration JSON export
+## Important methodological notes
 
-### Tracking
-- CSV-based performance tracking
-- suitable for ROI / win rate / CLV workflows
-- portable because Streamlit Community Cloud local storage is not guaranteed to persist
-
-## Important limitation
-
-This is a complete **MLB research platform**, not a claim that the model has a proven betting edge.
-
-The app now contains the machinery needed to test and calibrate the model. The user must run meaningful historical samples before trusting Edge Scores or EV.
-
-## Other sports
-
-NFL, NCAA Football, and PGA are intentionally not assigned fake model probabilities. They require their own:
-- historical datasets
-- sport-specific features
-- backtests
-- calibration
-
-The app contains a roadmap tab explaining those inputs.
+1. This app still uses a relatively simple MLB feature set.
+2. Historical sportsbook availability depends on the user's Odds API plan.
+3. A model should not be considered validated because one edge threshold shows positive ROI.
+4. Look for:
+   - multiple non-overlapping test windows
+   - stable calibration
+   - Brier/log-loss competitiveness vs market
+   - adequate sample size
+   - positive ROI that persists across windows
+5. Do not repeatedly tune on the same test period.
 
 ## Deployment
 
-Replace the existing files in the GitHub repository used by Streamlit:
+Replace your existing:
+- app.py
+- requirements.txt
 
-- `app.py`
-- `requirements.txt`
-- `README.md` (optional)
+Keep:
+THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"
 
-Keep the existing Streamlit Secret:
+inside Streamlit Secrets.
 
-`THE_ODDS_API_KEY = "YOUR_KEY"`
+## Next step after v4
 
-Do not store the key in GitHub.
-
-## Suggested validation workflow
-
-1. Run a 14-day backtest.
-2. Check that it completes successfully.
-3. Run several non-overlapping 30-45 day windows.
-4. Export each CSV.
-5. Compare Brier score and calibration.
-6. If historical odds are supported, review ROI by minimum edge.
-7. Fit calibration only on one period and evaluate it on a later period.
-8. Do not tune coefficients repeatedly against the same test sample.
-9. Track closing-line value for live recommendations.
-10. Only then consider raising confidence thresholds.
-
-## Next technical step
-
-A true v4 would replace the hand-set run coefficients with a trained ensemble using a durable historical database and would add:
-- confirmed batter-level lineup projections
+If walk-forward results are competitive with the market, v5 should replace the hand-built feature weights with a richer trained model using:
+- Statcast quality metrics
+- confirmed batter-level lineups
 - platoon splits
-- reliever availability / fatigue
+- true bullpen availability/fatigue
 - park factors
-- Statcast-derived quality metrics
-- historical closing odds
-- scheduled model retraining
-- persistent database
+- historical closing prices
+- persistent storage
