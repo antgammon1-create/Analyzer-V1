@@ -333,6 +333,139 @@ def football_board(sport_key,label,league):
             st.dataframe(pd.DataFrame([{"Game":f'{e["away_team"]} @ {e["home_team"]}',"Start":e.get("commence_time")} for e in pre]),
                          use_container_width=True,hide_index=True)
 
+
+@st.cache_data(ttl=900)
+def mlb_schedule_today():
+    today=datetime.now(timezone.utc).date().isoformat()
+    r=requests.get("https://statsapi.mlb.com/api/v1/schedule",params={
+        "sportId":1,"date":today,"hydrate":"probablePitcher,team,venue"
+    },timeout=25)
+    r.raise_for_status()
+    games=[]
+    for d in r.json().get("dates",[]):
+        for g in d.get("games",[]):
+            games.append(g)
+    return games
+
+def market_two_way(event, market_key, outcome_names=None):
+    rows=[]
+    for b in event.get("bookmakers",[]):
+        m=next((x for x in b.get("markets",[]) if x.get("key")==market_key),None)
+        if not m: continue
+        outs=m.get("outcomes",[])
+        if market_key=="h2h":
+            wanted=outcome_names or [event.get("home_team"),event.get("away_team")]
+            found={o.get("name"):o for o in outs}
+            if all(x in found and found[x].get("price") is not None for x in wanted):
+                p=[american_to_prob(found[x]["price"]) for x in wanted]
+                z=sum(p)
+                if z:
+                    rows.append({"book":b.get("title",b.get("key","")),
+                                 "names":wanted,"prices":[found[x]["price"] for x in wanted],
+                                 "novig":[x/z for x in p]})
+        elif market_key=="totals":
+            over=next((o for o in outs if o.get("name")=="Over"),None)
+            under=next((o for o in outs if o.get("name")=="Under"),None)
+            if over and under and over.get("price") is not None and under.get("price") is not None and over.get("point")==under.get("point"):
+                po,pu=american_to_prob(over["price"]),american_to_prob(under["price"]); z=po+pu
+                if z:
+                    rows.append({"book":b.get("title",b.get("key","")),"point":over.get("point"),
+                                 "names":["Over","Under"],"prices":[over["price"],under["price"]],
+                                 "novig":[po/z,pu/z]})
+    return rows
+
+def mlb_board():
+    st.subheader("⚾ MLB — Current Betting Board")
+    odds,meta=get_odds("baseball_mlb","h2h,spreads,totals")
+    if meta.get("error"):
+        st.error(meta["error"]); return
+    if not odds:
+        st.info("No current MLB markets returned."); return
+
+    # Pitcher context from official MLB schedule, used as context rather than an unvalidated probability engine.
+    pitcher_map={}
+    try:
+        for g in mlb_schedule_today():
+            h=g.get("teams",{}).get("home",{}); a=g.get("teams",{}).get("away",{})
+            hn=h.get("team",{}).get("name",""); an=a.get("team",{}).get("name","")
+            pitcher_map[(norm_name(an),norm_name(hn))]=(
+                a.get("probablePitcher",{}).get("fullName","TBD"),
+                h.get("probablePitcher",{}).get("fullName","TBD")
+            )
+    except Exception:
+        pass
+
+    rows=[]
+    for e in odds:
+        h,a=e.get("home_team"),e.get("away_team")
+        books=market_two_way(e,"h2h",[h,a])
+        if not books: continue
+        hp=np.median([x["novig"][0] for x in books]); ap=1-hp
+        disp=float(np.std([x["novig"][0] for x in books])) if len(books)>1 else .03
+        for idx,team,mp in [(0,h,hp),(1,a,ap)]:
+            valid=[x for x in books if len(x["prices"])>idx]
+            best=max(valid,key=lambda x:x["prices"][idx])
+            price=best["prices"][idx]
+            pev=ev_per_unit(mp,price)
+            # MLB v6.1 is intentionally market-anchored until the prospective database validates an independent model.
+            sig="BET CANDIDATE" if len(books)>=4 and disp<=.05 and pev>=.035 else ("WATCH" if pev>=.015 else "PASS")
+            conf=confidence_score(len(books),disp,8,True,pev)
+            away_sp,home_sp=pitcher_map.get((norm_name(a),norm_name(h)),("TBD","TBD"))
+            rows.append({"Game":f"{a} @ {h}","Signal":sig,"Pick":f"{team} ML","Best odds":fmt_odds(price),
+                         "Book":best["book"],"Consensus fair %":mp*100,"Market-value EV %":pev*100,
+                         "Fair odds":fmt_odds(prob_to_american(mp)),"Books":len(books),
+                         "Market dispersion":disp*100,"Confidence":conf,
+                         "Away SP":away_sp,"Home SP":home_sp,"Start":e.get("commence_time")})
+
+        # Totals: only compare books at the modal total, preventing mixed-line comparisons.
+        totals=market_two_way(e,"totals")
+        if totals:
+            points=[x["point"] for x in totals if x.get("point") is not None]
+            if points:
+                modal=max(set(points),key=points.count)
+                same=[x for x in totals if x["point"]==modal]
+                if len(same)>=3:
+                    op=np.median([x["novig"][0] for x in same]); up=1-op
+                    tdisp=float(np.std([x["novig"][0] for x in same])) if len(same)>1 else .03
+                    for idx,name,mp in [(0,"Over",op),(1,"Under",up)]:
+                        best=max(same,key=lambda x:x["prices"][idx]); price=best["prices"][idx]
+                        pev=ev_per_unit(mp,price)
+                        sig="BET CANDIDATE" if len(same)>=4 and tdisp<=.05 and pev>=.035 else ("WATCH" if pev>=.015 else "PASS")
+                        rows.append({"Game":f"{a} @ {h}","Signal":sig,"Pick":f"{name} {modal}",
+                                     "Best odds":fmt_odds(price),"Book":best["book"],"Consensus fair %":mp*100,
+                                     "Market-value EV %":pev*100,"Fair odds":fmt_odds(prob_to_american(mp)),
+                                     "Books":len(same),"Market dispersion":tdisp*100,
+                                     "Confidence":confidence_score(len(same),tdisp,8,True,pev),
+                                     "Away SP":pitcher_map.get((norm_name(a),norm_name(h)),("TBD","TBD"))[0],
+                                     "Home SP":pitcher_map.get((norm_name(a),norm_name(h)),("TBD","TBD"))[1],
+                                     "Start":e.get("commence_time")})
+    df=pd.DataFrame(rows)
+    if df.empty:
+        st.info("No MLB two-way markets could be analyzed."); return
+    order={"BET CANDIDATE":0,"WATCH":1,"PASS":2}
+    df["_o"]=df.Signal.map(order).fillna(3)
+    df=df.sort_values(["_o","Market-value EV %","Confidence"],ascending=[True,False,False]).drop(columns="_o")
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Games",df.Game.nunique())
+    c2.metric("Bet candidates",(df.Signal=="BET CANDIDATE").sum())
+    c3.metric("Watch",(df.Signal=="WATCH").sum())
+    c4.metric("API remaining",meta.get("remaining") or "—")
+    st.markdown("### Top MLB signals")
+    for _,r in df.head(18).iterrows():
+        badge="🟢" if r.Signal=="BET CANDIDATE" else ("🟡" if r.Signal=="WATCH" else "⚪")
+        st.markdown(f'**{badge} {r.Signal} — {r.Pick} {r["Best odds"]}**  \n'
+                    f'Market-value EV **{r["Market-value EV %"]:+.1f}%** • Confidence **{int(r.Confidence)}/100**')
+        with st.expander(f'Details: {r.Game}'):
+            st.write(f'Best book: {r.Book}')
+            st.write(f'No-vig consensus probability: {r["Consensus fair %"]:.1f}%')
+            st.write(f'Consensus fair odds: {r["Fair odds"]}')
+            st.write(f'Books in comparison: {int(r.Books)}')
+            st.write(f'Market dispersion: {r["Market dispersion"]:.1f} pp')
+            st.write(f'Starting pitchers: {r["Away SP"]} / {r["Home SP"]}')
+    st.info("MLB is restored. This final board uses current multi-book no-vig consensus and best-price value. Starting pitchers are shown as context. It deliberately does not resurrect the old unvalidated +10–20% model edges.")
+    with st.expander("Full MLB table"):
+        st.dataframe(df,use_container_width=True,hide_index=True)
+
 def snapshot_status():
     st.subheader("📡 Prospective Odds Database")
     if not DATA_FILE.exists():
@@ -392,11 +525,13 @@ def golf_board():
 st.title("🎯 EDGE — Final Conservative Multi-Sport Model")
 st.caption("Market-anchored probabilities • best-price value • capped model adjustments • prospective validation")
 
-sport=st.sidebar.radio("Sport",["NFL","NCAA Football","PGA Golf","Prospective database"])
+sport=st.sidebar.radio("Sport",["MLB","NFL","NCAA Football","PGA Golf","Prospective database"])
 st.sidebar.markdown("---")
 st.sidebar.caption("A green label means a price is attractive versus current market consensus and the research lean agrees. It is not a guarantee of profit.")
 
-if sport=="NFL":
+if sport=="MLB":
+    mlb_board()
+elif sport=="NFL":
     football_board("americanfootball_nfl","NFL","nfl")
 elif sport=="NCAA Football":
     football_board("americanfootball_ncaaf","NCAA Football","college-football")
