@@ -1,62 +1,78 @@
-# EDGE MLB v2
+# EDGE MLB v2.1
 
-This is the next version of the EDGE MLB prototype.
+## What v2.1 fixes
 
-## What changed from v1
+### 1. Weather at first pitch
+v2 accidentally used the first hourly weather value returned by Open-Meteo.
+v2.1 converts MLB's UTC scheduled game time to the venue's local time using
+Open-Meteo's UTC offset and selects the nearest hourly forecast.
 
-v1 used the sportsbook market itself as the model probability, which meant it could not produce a genuine independent edge.
+### 2. No-vig consensus market
+v2 compared the model against one sportsbook's vigged implied probability.
+v2.1:
+- removes vig inside each sportsbook's two-way market
+- averages those probabilities across sportsbooks
+- separately keeps the best available bettor price
 
-v2 separates:
+### 3. More markets
+v2.1 analyzes:
+- Moneyline
+- Totals
+- Run lines / spreads
 
-**Sportsbook market probability**
-from
-**EDGE model probability**
+Each available market is priced from the same game simulation.
 
-The model currently uses:
-- MLB schedule
-- probable pitchers
-- current-season pitcher statistics
-- current-season team hitting statistics
-- venue coordinates
-- weather
-- home-field effect
-- Monte Carlo simulation
-- sportsbook price
+### 4. Data-quality scoring
+The Edge Score now incorporates:
+- probable-starter availability
+- lineup confirmation
+- weather quality
+- number of sportsbooks in consensus
+- market type
+- model stability
 
-It calculates:
-- model win probability
-- market-implied probability
-- percentage-point edge
-- fair American odds
-- expected value
-- Edge Score
+### 5. Confirmed lineup detection
+When MLB boxscore data contains batting orders, v2.1 marks the lineups confirmed.
+If not, it explicitly shows Projected/TBD and lowers data quality.
 
-## Streamlit setup
+### 6. Bullpen proxy
+v2.1 adds team pitching quality as a conservative bullpen-strength proxy.
+This is NOT yet true reliever fatigue/availability.
 
-Replace your existing `app.py` and `requirements.txt` with the files in this ZIP.
+### 7. Better labeling
+Expected value is displayed as **Uncalibrated EV** until historical validation is built.
 
-Keep your existing Streamlit Secret:
+## Deploying over your current app
 
-THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"
+In the GitHub repository currently connected to Streamlit:
 
-Do not put the key into GitHub or app.py.
+1. Replace `app.py` with the v2.1 `app.py`.
+2. Replace `requirements.txt`.
+3. Commit the changes.
+4. Streamlit should automatically redeploy.
 
-## Important
+Keep your existing Streamlit secret:
+`THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"`
 
-This is NOT yet a proven profitable betting model.
+Do not put the API key into GitHub.
 
-The coefficients are transparent research defaults. The next serious upgrade is historical backtesting/calibration using historical MLB games and odds.
+## Still needed before real-money trust
 
-After calibration, the roadmap is:
+The next major version should be historical validation rather than more cosmetics:
 
-1. Confirmed lineups
-2. Batter-level projections
-3. Platoon splits
-4. Bullpen availability and fatigue
-5. Park factors
-6. Better weather timing
-7. Historical odds / closing-line value
-8. Trained ensemble model
-9. ROI and calibration dashboard
-10. PGA, NFL, NCAA football
-11. Correlation-aware parlay engine
+- historical MLB games
+- historical odds snapshots
+- closing lines
+- out-of-sample train/test split
+- probability calibration
+- Brier score and log loss
+- ROI by market
+- CLV
+- performance by Edge Score band
+- true bullpen availability/fatigue
+- batter-level lineups
+- handedness/platoon splits
+- park-specific wind orientation
+- trained ensemble model
+
+Until that exists, v2.1 should be treated as a research model, not a proven betting system.
