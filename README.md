@@ -1,89 +1,23 @@
-# EDGE v4 — Walk-Forward Validation Lab
+# EDGE v4.1 — Historical Odds Diagnostics
 
-This build implements the validation methodology requested after the first backtest.
+This version fixes the silent historical-odds failure from v4.
 
-## Core upgrade
+## Main improvements
+- Dedicated one-date historical odds diagnostic
+- Explicit API error/status reporting
+- Historical snapshots aligned to 90 minutes before each game's scheduled first pitch
+- Match-rate reporting
+- Dataset build stops if historical odds were requested and zero games matched
+- Market benchmark remains available once historical probabilities exist
 
-Instead of evaluating/calibrating on one sample, v4 uses:
+## Recommended workflow
+1. Open Odds diagnostic.
+2. Pick a recent completed MLB date.
+3. Run diagnostic.
+4. If historical odds are unavailable, the app will show the API message.
+5. If available and matched, build your 90-day dataset with historical odds enabled.
+6. Run walk-forward.
+7. Open Market benchmark.
 
-**Train -> calibrate -> freeze -> test on unseen games -> walk forward**
-
-This is designed to reduce overfitting and provide a much more honest estimate of model quality.
-
-## Included
-
-### Historical dataset builder
-- completed MLB games
-- pre-game team and pitcher stats only
-- stats stop on the day before each game
-- raw model probability
-- optional historical sportsbook odds
-
-### Walk-forward testing
-User controls:
-- training-window size
-- test-window size
-- walk step
-- optional probability calibration
-
-For every unseen test window:
-- fit model only on prior training data
-- optionally calibrate only on training data
-- freeze the model
-- predict the next unseen window
-- advance forward
-
-### Evaluation
-- Brier score
-- log loss
-- classification accuracy
-- probability-band calibration
-- window-by-window stability
-
-### Market comparison
-If historical odds are available:
-- no-vig market benchmark
-- EDGE Brier vs sportsbook Brier
-- EDGE log loss vs sportsbook log loss
-- flat-stake ROI by minimum edge threshold
-- sample-size reporting
-
-### Exports
-- dataset CSV
-- walk-forward predictions CSV
-- validation summary JSON
-
-## Important methodological notes
-
-1. This app still uses a relatively simple MLB feature set.
-2. Historical sportsbook availability depends on the user's Odds API plan.
-3. A model should not be considered validated because one edge threshold shows positive ROI.
-4. Look for:
-   - multiple non-overlapping test windows
-   - stable calibration
-   - Brier/log-loss competitiveness vs market
-   - adequate sample size
-   - positive ROI that persists across windows
-5. Do not repeatedly tune on the same test period.
-
-## Deployment
-
-Replace your existing:
-- app.py
-- requirements.txt
-
-Keep:
+Keep your current Streamlit secret:
 THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"
-
-inside Streamlit Secrets.
-
-## Next step after v4
-
-If walk-forward results are competitive with the market, v5 should replace the hand-built feature weights with a richer trained model using:
-- Statcast quality metrics
-- confirmed batter-level lineups
-- platoon splits
-- true bullpen availability/fatigue
-- park factors
-- historical closing prices
-- persistent storage
