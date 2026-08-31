@@ -1,104 +1,98 @@
 
-import os, csv
 from pathlib import Path
 from datetime import datetime, timezone
-from collections import defaultdict
-import requests
+import os
 import pandas as pd
+import requests
 
 API_KEY=os.environ["THE_ODDS_API_KEY"]
-OUT=Path("data/odds_snapshots.csv")
+BASE="https://api.the-odds-api.com/v4"
+OUT=Path("data/market_snapshots.csv")
 OUT.parent.mkdir(parents=True,exist_ok=True)
 
-def implied_prob(odds):
-    odds=float(odds)
-    return 100/(odds+100) if odds>=0 else -odds/(-odds+100)
+SPORTS=[
+    ("baseball_mlb","h2h,spreads,totals"),
+    ("americanfootball_nfl","h2h,spreads,totals"),
+    ("americanfootball_ncaaf","h2h,spreads,totals"),
+]
 
-def no_vig(p1,p2):
-    s=p1+p2
-    return p1/s,p2/s
+def fetch(key,markets):
+    r=requests.get(f"{BASE}/sports/{key}/odds",params={
+        "apiKey":API_KEY,"regions":"us","markets":markets,
+        "oddsFormat":"american","dateFormat":"iso"
+    },timeout=30)
+    if r.status_code==422:
+        # Some sports may not expose every requested featured market at a given time.
+        return []
+    r.raise_for_status()
+    return r.json()
 
-r=requests.get(
-    "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds",
-    params={
-        "apiKey":API_KEY,
-        "regions":"us",
-        "markets":"h2h",
-        "oddsFormat":"american"
-    },
-    timeout=30
-)
-r.raise_for_status()
-events=r.json()
+def active_golf_keys():
+    r=requests.get(f"{BASE}/sports",params={"apiKey":API_KEY,"all":"true"},timeout=20)
+    r.raise_for_status()
+    return [x["key"] for x in r.json() if str(x.get("group","")).lower()=="golf" and x.get("active")]
 
-snapshot_time=datetime.now(timezone.utc).isoformat()
+snap=datetime.now(timezone.utc).isoformat()
 rows=[]
-
-for event in events:
-    probs=defaultdict(list)
-    offers=defaultdict(list)
-
-    for book in event.get("bookmakers",[]):
-        outcomes=None
-        for market in book.get("markets",[]):
-            if market.get("key")=="h2h":
-                outcomes=market.get("outcomes",[])
-                break
-        if not outcomes or len(outcomes)<2:
-            continue
-
-        pair=[o for o in outcomes if o.get("price") is not None][:2]
-        if len(pair)<2:
-            continue
-
-        p1,p2=no_vig(implied_prob(pair[0]["price"]),implied_prob(pair[1]["price"]))
-        for o,p in zip(pair,[p1,p2]):
-            probs[o["name"]].append(p)
-            offers[o["name"]].append((float(o["price"]),book.get("title","Book")))
-
-    home=event.get("home_team")
-    away=event.get("away_team")
-    if home not in probs or away not in probs:
+for sport_key,markets in SPORTS:
+    try:
+        events=fetch(sport_key,markets)
+    except Exception as e:
+        print(f"{sport_key}: {e}")
         continue
+    for ev in events:
+        for book in ev.get("bookmakers",[]):
+            for market in book.get("markets",[]):
+                for o in market.get("outcomes",[]):
+                    rows.append({
+                        "snapshot_time":snap,
+                        "sport_key":sport_key,
+                        "event_id":ev.get("id"),
+                        "commence_time":ev.get("commence_time"),
+                        "home_team":ev.get("home_team"),
+                        "away_team":ev.get("away_team"),
+                        "book_key":book.get("key"),
+                        "book":book.get("title"),
+                        "market":market.get("key"),
+                        "outcome":o.get("name"),
+                        "point":o.get("point"),
+                        "price":o.get("price"),
+                    })
 
-    def side(team):
-        best=min(offers[team],key=lambda x: implied_prob(x[0]))
-        return sum(probs[team])/len(probs[team]),best[0],best[1],len(probs[team])
-
-    hp,ho,hb,hbooks=side(home)
-    ap,ao,ab,abooks=side(away)
-
-    rows.append({
-        "snapshot_time":snapshot_time,
-        "event_id":event.get("id"),
-        "commence_time":event.get("commence_time"),
-        "home_team":home,
-        "away_team":away,
-        "home_no_vig_prob":hp,
-        "away_no_vig_prob":ap,
-        "home_best_odds":ho,
-        "away_best_odds":ao,
-        "home_best_book":hb,
-        "away_best_book":ab,
-        "books":min(hbooks,abooks),
-    })
+# Golf: collect any currently active golf outright feed exposed by the user's plan.
+for key in active_golf_keys():
+    try:
+        events=fetch(key,"outrights")
+    except Exception as e:
+        print(f"{key}: {e}")
+        continue
+    for ev in events:
+        for book in ev.get("bookmakers",[]):
+            for market in book.get("markets",[]):
+                for o in market.get("outcomes",[]):
+                    rows.append({
+                        "snapshot_time":snap,
+                        "sport_key":key,
+                        "event_id":ev.get("id"),
+                        "commence_time":ev.get("commence_time"),
+                        "home_team":ev.get("home_team"),
+                        "away_team":ev.get("away_team"),
+                        "book_key":book.get("key"),
+                        "book":book.get("title"),
+                        "market":market.get("key"),
+                        "outcome":o.get("name"),
+                        "point":o.get("point"),
+                        "price":o.get("price"),
+                    })
 
 new=pd.DataFrame(rows)
 if OUT.exists():
     old=pd.read_csv(OUT)
-    combined=pd.concat([old,new],ignore_index=True)
+    df=pd.concat([old,new],ignore_index=True)
 else:
-    combined=new
-
-if not combined.empty:
-    combined["snapshot_time"]=pd.to_datetime(combined["snapshot_time"],utc=True,errors="coerce")
-    combined["commence_time"]=pd.to_datetime(combined["commence_time"],utc=True,errors="coerce")
-    # Keep one row per game per collector run.
-    combined=combined.drop_duplicates(
-        subset=["event_id","snapshot_time"],keep="last"
-    ).sort_values(["commence_time","snapshot_time"])
-    combined.to_csv(OUT,index=False)
-else:
-    OUT.write_text("snapshot_time,event_id,commence_time,home_team,away_team,home_no_vig_prob,away_no_vig_prob,home_best_odds,away_best_odds,home_best_book,away_best_book,books\n")
-
-print(f"Saved {len(new)} current MLB events; total rows {len(combined)}")
+    df=new
+if not df.empty:
+    dedupe=[c for c in ["snapshot_time","sport_key","event_id","book_key","market","outcome","point"] if c in df.columns]
+    df=df.drop_duplicates(subset=dedupe,keep="last")
+df.to_csv(OUT,index=False)
+print(f"Wrote {len(new)} new observations; database now {len(df)} rows.")
