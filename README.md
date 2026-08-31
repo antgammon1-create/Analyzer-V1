@@ -1,78 +1,78 @@
-# EDGE MLB v2.1
+# EDGE MLB v2.2
 
-## What v2.1 fixes
+This release focuses on reliability and fixes the issues exposed in v2.1.
 
-### 1. Weather at first pitch
-v2 accidentally used the first hourly weather value returned by Open-Meteo.
-v2.1 converts MLB's UTC scheduled game time to the venue's local time using
-Open-Meteo's UTC offset and selects the nearest hourly forecast.
+## Major fixes
 
-### 2. No-vig consensus market
-v2 compared the model against one sportsbook's vigged implied probability.
-v2.1:
-- removes vig inside each sportsbook's two-way market
-- averages those probabilities across sportsbooks
-- separately keeps the best available bettor price
+### 1. Weather unit bug fixed
+Open-Meteo returns temperatures in Celsius unless a Fahrenheit unit is explicitly requested.
+v2.1 displayed that Celsius value as if it were Fahrenheit.
 
-### 3. More markets
-v2.1 analyzes:
-- Moneyline
-- Totals
-- Run lines / spreads
+v2.2 converts Celsius to Fahrenheit before displaying or using it.
 
-Each available market is priced from the same game simulation.
+### 2. Venue coordinate validation
+MLB venue coordinates are checked for plausible U.S./Canada bounds.
+A small fallback table is included for several major parks if coordinates are missing or invalid.
 
-### 4. Data-quality scoring
-The Edge Score now incorporates:
-- probable-starter availability
-- lineup confirmation
-- weather quality
-- number of sportsbooks in consensus
-- market type
-- model stability
+### 3. Weather sanity layer
+Weather must:
+- match first pitch within roughly 1.5 hours
+- pass plausible temperature bounds
+- pass a simple seasonal sanity check
 
-### 5. Confirmed lineup detection
-When MLB boxscore data contains batting orders, v2.1 marks the lineups confirmed.
-If not, it explicitly shows Projected/TBD and lowers data quality.
+If weather fails validation, it is shown with a warning and ignored by the model.
 
-### 6. Bullpen proxy
-v2.1 adds team pitching quality as a conservative bullpen-strength proxy.
-This is NOT yet true reliever fatigue/availability.
+### 4. Market-disagreement penalty
+v2.1 could reward a huge model-market disagreement too aggressively.
 
-### 7. Better labeling
-Expected value is displayed as **Uncalibrated EV** until historical validation is built.
+v2.2 treats a large disagreement with a liquid multi-book market as a reason for caution:
+- Edge Score is reduced
+- reliability can be marked CAUTION
+- the user is explicitly warned to verify inputs
 
-## Deploying over your current app
+### 5. Explainable run projection
+Every recommended market includes an expander showing the run-projection components:
+- baseline
+- home field
+- offense
+- opposing starter
+- opposing bullpen proxy
+- weather
 
-In the GitHub repository currently connected to Streamlit:
+### 6. Reliability labels
+Each signal is marked:
+- HIGH
+- MEDIUM
+- LOW
+- CAUTION
 
-1. Replace `app.py` with the v2.1 `app.py`.
-2. Replace `requirements.txt`.
-3. Commit the changes.
-4. Streamlit should automatically redeploy.
+The label is based on:
+- data quality
+- size of model-market disagreement
+- number of books
+- Edge Score
 
-Keep your existing Streamlit secret:
+## Deployment
+
+Replace your existing `app.py` and `requirements.txt` in the GitHub repository connected to Streamlit.
+
+Keep your current Streamlit secret:
 `THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"`
 
-Do not put the API key into GitHub.
+Do not put your API key in GitHub.
 
-## Still needed before real-money trust
+## Still not finished
 
-The next major version should be historical validation rather than more cosmetics:
+v2.2 is a research model, not a proven profitable betting system.
 
-- historical MLB games
-- historical odds snapshots
+The next major version should be historical validation:
+- historical MLB results
+- historical odds
 - closing lines
-- out-of-sample train/test split
-- probability calibration
-- Brier score and log loss
-- ROI by market
+- calibration
+- Brier score / log loss
+- ROI
 - CLV
+- performance by market
 - performance by Edge Score band
-- true bullpen availability/fatigue
-- batter-level lineups
-- handedness/platoon splits
-- park-specific wind orientation
-- trained ensemble model
-
-Until that exists, v2.1 should be treated as a research model, not a proven betting system.
+- trained coefficients / ensemble model
