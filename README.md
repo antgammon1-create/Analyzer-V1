@@ -1,23 +1,57 @@
-# EDGE v4.1 — Historical Odds Diagnostics
+# EDGE v4.2 — Free Prospective Validation
 
-This version fixes the silent historical-odds failure from v4.
+This redesign removes the dependency on a paid historical-odds subscription.
 
-## Main improvements
-- Dedicated one-date historical odds diagnostic
-- Explicit API error/status reporting
-- Historical snapshots aligned to 90 minutes before each game's scheduled first pitch
-- Match-rate reporting
-- Dataset build stops if historical odds were requested and zero games matched
-- Market benchmark remains available once historical probabilities exist
+## How it works
 
-## Recommended workflow
-1. Open Odds diagnostic.
-2. Pick a recent completed MLB date.
-3. Run diagnostic.
-4. If historical odds are unavailable, the app will show the API message.
-5. If available and matched, build your 90-day dataset with historical odds enabled.
-6. Run walk-forward.
-7. Open Market benchmark.
+The Odds API's paid historical endpoint is no longer used.
 
-Keep your current Streamlit secret:
-THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"
+Instead, a GitHub Action periodically calls the normal current MLB moneyline endpoint and saves a timestamped snapshot to:
+
+`data/odds_snapshots.csv`
+
+Over time, your own repository becomes your historical odds database.
+
+The Streamlit app then matches completed MLB games to a pregame snapshot (preferably about 90 minutes before first pitch) and performs:
+
+- EDGE vs market Brier score
+- EDGE vs market log loss
+- prospective walk-forward testing
+- ROI by model edge threshold
+
+## Why this is more honest than finding random free historical odds online
+
+Free public historical betting datasets often have unclear timestamps, missing books, survivorship problems, or licensing issues.
+
+v4.2 records exactly what your own app could have seen at the time.
+
+## Files
+
+- `app.py` — Streamlit validation app
+- `collector.py` — current odds collector
+- `.github/workflows/collect_odds.yml` — scheduled collector
+- `data/odds_snapshots.csv` — accumulated snapshots
+
+## Required setup
+
+You already have THE_ODDS_API_KEY in Streamlit Secrets.
+
+You must ALSO add the same key as a GitHub repository Actions secret named:
+
+`THE_ODDS_API_KEY`
+
+Do not commit the API key into a file.
+
+## GitHub Action schedule
+
+The included workflow runs four times per day during typical MLB windows.
+
+It can also be run manually from:
+
+GitHub -> Actions -> Collect MLB odds snapshots -> Run workflow
+
+## Important limitation
+
+This method starts collecting history from the day you install it. It cannot reconstruct old sportsbook prices.
+
+That is a feature, not a flaw: all benchmark data is genuinely time-stamped and observable prospectively.
