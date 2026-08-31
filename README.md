@@ -1,134 +1,62 @@
+# EDGE MLB v2
 
-# EDGE Sports Betting Analyzer — MVP v1
+This is the next version of the EDGE MLB prototype.
 
-A mobile-friendly Streamlit prototype for a quantitative sports betting app covering:
+## What changed from v1
 
-- MLB
-- PGA Tour
-- NFL
-- NCAA Football
+v1 used the sportsbook market itself as the model probability, which meant it could not produce a genuine independent edge.
 
-## What is implemented
+v2 separates:
 
-- Mobile-friendly dashboard
-- Sport selector
-- Demo data so the app works immediately
-- Optional live odds integration through The Odds API
-- American odds -> implied probability
-- Fair price calculation
-- Expected value calculation
-- Edge Score (0-100)
-- Confidence score
-- Bet / Lean / Pass classification
-- Parlay Lab prototype
-- PGA dark-horse board
-- AI Analyst interface placeholder
+**Sportsbook market probability**
+from
+**EDGE model probability**
+
+The model currently uses:
+- MLB schedule
+- probable pitchers
+- current-season pitcher statistics
+- current-season team hitting statistics
+- venue coordinates
+- weather
+- home-field effect
+- Monte Carlo simulation
+- sportsbook price
+
+It calculates:
+- model win probability
+- market-implied probability
+- percentage-point edge
+- fair American odds
+- expected value
+- Edge Score
+
+## Streamlit setup
+
+Replace your existing `app.py` and `requirements.txt` with the files in this ZIP.
+
+Keep your existing Streamlit Secret:
+
+THE_ODDS_API_KEY = "YOUR_EXISTING_KEY"
+
+Do not put the key into GitHub or app.py.
 
 ## Important
 
-The current v1 is an application **shell + analytics framework**, not a finished predictive model.
+This is NOT yet a proven profitable betting model.
 
-The demo probabilities are illustrative. They must NOT be used as real betting advice.
+The coefficients are transparent research defaults. The next serious upgrade is historical backtesting/calibration using historical MLB games and odds.
 
-The next development stage is to replace the placeholder probability adjustments with trained, sport-specific models and historical backtesting.
+After calibration, the roadmap is:
 
-## Run on a computer
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Then open the URL shown by Streamlit.
-
-## Live odds
-
-Create an environment variable:
-
-```bash
-export THE_ODDS_API_KEY="YOUR_KEY"
-```
-
-Or add this to Streamlit secrets:
-
-```toml
-THE_ODDS_API_KEY = "YOUR_KEY"
-```
-
-The app uses the key only to retrieve live odds. You should verify the provider's current coverage, terms, limits, and pricing before deployment.
-
-## Put it on an iPhone
-
-The easiest first deployment is a hosted Streamlit app. Once deployed, open it in Safari and use:
-
-Share -> Add to Home Screen
-
-That creates an app-like icon on the iPhone.
-
-For a true App Store product, the next phase should put this analytics engine behind a proper iOS/PWA front end and a secure backend. API keys should never be shipped inside an iPhone client.
-
-## Production roadmap
-
-### v2 — MLB
-- Historical MLB database
-- Starting pitcher projections
-- Lineup projections
-- Bullpen availability
-- Park factors
-- Weather by stadium
-- Platoon splits
-- xwOBA / wRC+ / SIERA / FIP
-- Monte Carlo game simulation
-- Moneyline / run line / total probabilities
-- Historical odds and closing line
-- Calibration
-- Backtesting
-- CLV tracking
-
-### v3 — PGA
-- Player database
-- Strokes gained features
-- Course-fit model
-- Weather/wave model
-- Win/top-5/top-10/top-20 probabilities
-- Dark Horse model
-
-### v4 — NFL
-- EPA
-- success rate
-- QB model
-- injuries
-- matchup model
-- weather
-- spread / total / moneyline probabilities
-
-### v5 — NCAA Football
-- talent
-- transfers
-- returning production
-- coaching
-- opponent-adjusted efficiency
-- matchup model
-
-### v6 — Parlays
-- Joint probability
-- Correlation matrix
-- Same-game parlay modeling
-- Price shopping
-- EV optimization
-
-### v7 — AI Analyst
-- Natural-language questions
-- Explainable recommendations
-- "Why do you like this?"
-- "What changed?"
-- "What is the minimum price?"
-- "Build conservative/balanced/aggressive parlay"
-
-### v8 — Tracking
-- Every recommendation stored
-- ROI
-- units
-- CLV
-- calibration
-- performance by sport / market / Edge Score band
+1. Confirmed lineups
+2. Batter-level projections
+3. Platoon splits
+4. Bullpen availability and fatigue
+5. Park factors
+6. Better weather timing
+7. Historical odds / closing-line value
+8. Trained ensemble model
+9. ROI and calibration dashboard
+10. PGA, NFL, NCAA football
+11. Correlation-aware parlay engine

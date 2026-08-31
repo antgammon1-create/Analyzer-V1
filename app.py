@@ -1,507 +1,359 @@
-
-import os, math, json, time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-
+import os, math, random
+from datetime import date
 import requests
 import pandas as pd
 import streamlit as st
 
-# ============================================================
-# EDGE — Sports Betting Analytics MVP
-# Supports: MLB, PGA Tour, NFL, NCAA Football
-#
-# This is an MVP architecture:
-#   Data -> Model probability -> Fair price -> Market price
-#        -> EV -> Edge Score -> AI-ready explanation
-#
-# Live odds require THE_ODDS_API_KEY.
-# Weather uses Open-Meteo and requires no API key.
-# ============================================================
+st.set_page_config(page_title="EDGE MLB v2", page_icon="📈", layout="wide")
 
-st.set_page_config(
-    page_title="EDGE Sports Analyzer",
-    page_icon="📈",
-    layout="wide",
-)
+MLB = "https://statsapi.mlb.com/api/v1"
+ODDS_SPORT = "baseball_mlb"
+WEATHER = "https://api.open-meteo.com/v1/forecast"
 
-SPORTS = {
-    "MLB": "baseball_mlb",
-    "NFL": "americanfootball_nfl",
-    "NCAA Football": "americanfootball_ncaaf",
-    "PGA Tour": "golf_pga",
-}
-
-DEFAULTS = {
-    "mlb": {"home_adv": 0.045, "spread": 0.11},
-    "nfl": {"home_adv": 0.055, "spread": 0.13},
-    "ncaaf": {"home_adv": 0.065, "spread": 0.18},
-    "pga": {"home_adv": 0.0, "spread": 0.20},
-}
-
-# ----------------------------
-# Odds helpers
-# ----------------------------
-
-def american_to_prob(odds: float) -> float:
-    if odds is None:
-        return 0.5
-    odds = float(odds)
-    if odds > 0:
-        return 100 / (odds + 100)
-    return (-odds) / ((-odds) + 100)
-
-def american_to_decimal(odds: float) -> float:
-    odds = float(odds)
-    return 1 + (odds / 100 if odds > 0 else 100 / abs(odds))
-
-def prob_to_american(p: float) -> int:
-    p = min(max(float(p), 0.0001), 0.9999)
-    if p >= 0.5:
-        return round(-100 * p / (1 - p))
-    return round(100 * (1 - p) / p)
-
-def ev_per_unit(p: float, odds: float) -> float:
-    d = american_to_decimal(odds)
-    return p * (d - 1) - (1 - p)
-
-def remove_vig_two_way(p1: float, p2: float) -> Tuple[float, float]:
-    total = p1 + p2
-    if total <= 0:
-        return 0.5, 0.5
-    return p1 / total, p2 / total
-
-# ----------------------------
-# API
-# ----------------------------
-
-def get_odds_api_key() -> str:
-    key = os.getenv("THE_ODDS_API_KEY", "")
+def secret(name):
+    v = os.getenv(name, "")
     try:
-        key = st.secrets.get("THE_ODDS_API_KEY", key)
+        v = st.secrets.get(name, v)
     except Exception:
         pass
-    return key
+    return v
+
+@st.cache_data(ttl=300)
+def get_json(url, params=None):
+    r = requests.get(url, params=params or {}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def implied_prob(odds):
+    odds = float(odds)
+    return 100/(odds+100) if odds >= 0 else -odds/(-odds+100)
+
+def fair_price(p):
+    p = max(.0001, min(.9999, float(p)))
+    return round(-100*p/(1-p)) if p >= .5 else round(100*(1-p)/p)
+
+def ev_pct(p, odds):
+    odds = float(odds)
+    dec = 1 + (odds/100 if odds >= 0 else 100/abs(odds))
+    return (p*dec - 1)*100
+
+@st.cache_data(ttl=300)
+def get_schedule(d):
+    return get_json(f"{MLB}/schedule", {
+        "sportId": 1, "date": d,
+        "hydrate": "probablePitcher,team,venue"
+    }).get("dates", [])
+
+def games_for(d):
+    out = []
+    for day in get_schedule(d):
+        for g in day.get("games", []):
+            h = g.get("teams", {}).get("home", {})
+            a = g.get("teams", {}).get("away", {})
+            out.append({
+                "gamePk": g.get("gamePk"),
+                "status": g.get("status", {}).get("detailedState"),
+                "home": h.get("team", {}).get("name", "Home"),
+                "home_id": h.get("team", {}).get("id"),
+                "away": a.get("team", {}).get("name", "Away"),
+                "away_id": a.get("team", {}).get("id"),
+                "hp": (h.get("probablePitcher") or {}).get("fullName"),
+                "hp_id": (h.get("probablePitcher") or {}).get("id"),
+                "ap": (a.get("probablePitcher") or {}).get("fullName"),
+                "ap_id": (a.get("probablePitcher") or {}).get("id"),
+                "venue_id": (g.get("venue") or {}).get("id"),
+            })
+    return out
+
+SEASON = date.today().year
+
+@st.cache_data(ttl=900)
+def pitcher_stats(pid):
+    if not pid:
+        return {}
+    data = get_json(f"{MLB}/people/{pid}/stats", {
+        "stats": "season", "group": "pitching", "season": SEASON
+    })
+    splits = data.get("stats", [{}])[0].get("splits") or []
+    s = splits[0].get("stat", {}) if splits else {}
+    return {
+        "era": float(s.get("era", 4.30) or 4.30),
+        "whip": float(s.get("whip", 1.30) or 1.30),
+        "k9": float(s.get("strikeoutsPer9Inn", 8.5) or 8.5),
+        "hr9": float(s.get("homeRunsPer9", 1.2) or 1.2),
+    }
+
+@st.cache_data(ttl=900)
+def team_hitting(tid):
+    if not tid:
+        return {}
+    data = get_json(f"{MLB}/teams/{tid}/stats", {
+        "stats": "season", "group": "hitting",
+        "season": SEASON, "sportIds": 1
+    })
+    splits = data.get("stats", [{}])[0].get("splits") or []
+    s = splits[0].get("stat", {}) if splits else {}
+    return {
+        "avg": float(s.get("avg", .240) or .240),
+        "obp": float(s.get("obp", .310) or .310),
+        "slg": float(s.get("slg", .400) or .400),
+        "ops": float(s.get("ops", .710) or .710),
+    }
+
+@st.cache_data(ttl=900)
+def venue_info(vid):
+    if not vid:
+        return {}
+    data = get_json(f"{MLB}/venues/{vid}", {"hydrate": "location"})
+    venues = data.get("venues", [])
+    if not venues:
+        return {}
+    v = venues[0]
+    coords = v.get("location", {}).get("defaultCoordinates", {})
+    return {
+        "name": v.get("name", ""),
+        "lat": coords.get("latitude"),
+        "lon": coords.get("longitude"),
+    }
+
+@st.cache_data(ttl=900)
+def weather(lat, lon):
+    if lat is None or lon is None:
+        return {}
+    return get_json(WEATHER, {
+        "latitude": lat, "longitude": lon,
+        "hourly": "temperature_2m,precipitation_probability,wind_speed_10m",
+        "forecast_days": 2, "timezone": "auto"
+    })
+
+def pitcher_quality(s):
+    if not s:
+        return 0
+    x = ((4.30-s["era"])*.18 +
+         (1.30-s["whip"])*.70 +
+         (s["k9"]-8.5)*.035 +
+         (1.20-s["hr9"])*.18)
+    return max(-1.25, min(1.25, x))
+
+def offense_quality(s):
+    if not s:
+        return 0
+    x = ((s["ops"]-.710)*2.4 +
+         (s["obp"]-.310)*1.4 +
+         (s["slg"]-.400)*1.2)
+    return max(-1.25, min(1.25, x))
+
+def projection(g):
+    hp, ap = pitcher_stats(g["hp_id"]), pitcher_stats(g["ap_id"])
+    ho, ao = team_hitting(g["home_id"]), team_hitting(g["away_id"])
+
+    v = venue_info(g["venue_id"])
+    w = weather(v.get("lat"), v.get("lon")) if v else {}
+    h = w.get("hourly", {})
+    temp = (h.get("temperature_2m") or [70])[0]
+    wind = (h.get("wind_speed_10m") or [0])[0]
+    rain = (h.get("precipitation_probability") or [0])[0]
+
+    weather_adj = (
+        .10 if temp >= 85 else
+        -.08 if temp <= 45 else 0
+    )
+    weather_adj += .08 if wind >= 15 else 0
+    weather_adj -= .05 if rain >= 60 else 0
+
+    home = 4.45 + .20 + .55*offense_quality(ho) - .75*pitcher_quality(ap) + .15*pitcher_quality(hp) + weather_adj/2
+    away = 4.45 + .55*offense_quality(ao) - .75*pitcher_quality(hp) + .15*pitcher_quality(ap) + weather_adj/2
+
+    return max(1.5, min(8.5, home)), max(1.5, min(8.5, away)), {
+        "weather": f"{temp:.0f}°F · {wind:.0f} mph wind · {rain:.0f}% rain",
+        "venue": v.get("name", "")
+    }
+
+def poisson(rng, lam):
+    L = math.exp(-lam)
+    k, p = 0, 1.0
+    while p > L:
+        k += 1
+        p *= rng.random()
+    return k-1
+
+def simulate(hr, ar, n, seed):
+    rng = random.Random(seed)
+    hw = aw = over = 0
+    for _ in range(n):
+        h, a = poisson(rng, hr), poisson(rng, ar)
+        hw += h > a
+        aw += a > h
+        over += h+a > 8.5
+    return hw/n, aw/n, over/n
 
 @st.cache_data(ttl=90)
-def fetch_odds(sport_key: str, regions="us", markets="h2h,spreads,totals"):
-    key = get_odds_api_key()
+def odds_feed():
+    key = secret("THE_ODDS_API_KEY")
     if not key:
-        return [], "No THE_ODDS_API_KEY configured. Demo mode is active."
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": key,
-        "regions": regions,
-        "markets": markets,
-        "oddsFormat": "american",
-    }
+        return [], "THE_ODDS_API_KEY is missing from Streamlit Secrets."
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{ODDS_SPORT}/odds",
+            params={
+                "apiKey": key,
+                "regions": "us",
+                "markets": "h2h,spreads,totals",
+                "oddsFormat": "american"
+            },
+            timeout=20
+        )
         r.raise_for_status()
         return r.json(), None
     except Exception as e:
         return [], f"Odds API error: {e}"
 
-# ----------------------------
-# Weather
-# ----------------------------
+def norm(s):
+    return "".join(c.lower() for c in s if c.isalnum())
 
-@st.cache_data(ttl=900)
-def fetch_weather(lat: float, lon: float):
-    try:
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "hourly": "temperature_2m,precipitation_probability,wind_speed_10m,wind_direction_10m",
-            "forecast_days": 2,
-            "timezone": "auto",
-        }
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
+def best_moneylines(event):
+    prices = {}
+    for book in event.get("bookmakers", []):
+        for market in book.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+            for outcome in market.get("outcomes", []):
+                prices.setdefault(outcome["name"], []).append(
+                    (float(outcome["price"]), book.get("title", "Book"))
+                )
+    return [(team, min(vals, key=lambda x: implied_prob(x[0])))
+            for team, vals in prices.items()]
 
-def weather_impact(temp_f: float, wind_mph: float, precip_pct: float, sport: str) -> Dict:
-    """
-    Conservative first-pass weather adjustment.
-    This is intentionally bounded; production models should learn
-    sport/venue-specific effects from historical data.
-    """
-    impact = 0.0
-    notes = []
+def edge_score(edge, data=80, stability=75, market=88, situational=72):
+    edge_component = min(100, max(0, edge*5))
+    return int(round(max(0, min(100,
+        edge_component*.35 +
+        data*.20 +
+        stability*.20 +
+        market*.10 +
+        situational*.15
+    ))))
 
-    if sport in ("MLB",):
-        if temp_f >= 85:
-            impact += 0.12
-            notes.append("warm air can modestly support offense")
-        elif temp_f <= 45:
-            impact -= 0.08
-            notes.append("cold air can modestly suppress offense")
-        if wind_mph >= 15:
-            impact += 0.10
-            notes.append("strong wind increases variance")
-    elif sport in ("NFL", "NCAA Football"):
-        if wind_mph >= 15:
-            impact -= 0.05
-            notes.append("wind can suppress passing/kicking efficiency")
-        if precip_pct >= 50:
-            impact -= 0.03
-            notes.append("meaningful precipitation risk")
-        if temp_f <= 35:
-            impact -= 0.02
-            notes.append("cold conditions")
-    elif sport == "PGA Tour":
-        if wind_mph >= 15:
-            impact += 0.08
-            notes.append("wind increases importance of ball-striking/trajectory")
-        if precip_pct >= 50:
-            impact += 0.04
-            notes.append("weather increases variance and course-condition uncertainty")
-
-    return {"impact": impact, "notes": notes}
-
-# ----------------------------
-# Model
-# ----------------------------
-
-def logistic(x: float) -> float:
-    x = max(min(x, 30), -30)
-    return 1 / (1 + math.exp(-x))
-
-def model_game_probability(
-    sport: str,
-    market_home_prob: float,
-    form_edge: float,
-    matchup_edge: float,
-    injury_edge: float,
-    rest_edge: float,
-    weather_edge: float,
-) -> float:
-    """
-    MVP probability model.
-
-    In production, these coefficients are replaced by trained,
-    sport-specific models and calibrated against historical results.
-    """
-    base_logit = math.log(market_home_prob / (1 - market_home_prob))
-    s = sport.lower()
-    spread = DEFAULTS["pga" if "pga" in s else s]["spread"]
-    adjustment = (form_edge + matchup_edge + injury_edge + rest_edge + weather_edge) / spread
-    return logistic(base_logit + adjustment)
-
-def edge_score(
-    probability_edge: float,
-    model_confidence: float,
-    data_quality: float,
-    market_quality: float,
-    situational: float,
-    stability: float,
-    line_quality: float,
-) -> int:
-    """
-    Score components are 0-100.
-    Probability edge is expressed as percentage points.
-    """
-    edge_component = min(max(probability_edge * 5, 0), 100)
-    score = (
-        edge_component * 0.35
-        + model_confidence * 0.20
-        + data_quality * 0.10
-        + market_quality * 0.10
-        + situational * 0.10
-        + stability * 0.10
-        + line_quality * 0.05
-    )
-    return int(round(min(max(score, 0), 100)))
-
-def confidence_from_inputs(data_quality: float, stability: float, sample_quality: float) -> int:
-    return int(round(0.4 * data_quality + 0.35 * stability + 0.25 * sample_quality))
-
-# ----------------------------
-# Demo dataset
-# ----------------------------
-
-def demo_bets(sport: str) -> List[Dict]:
-    if sport == "MLB":
-        return [
-            {
-                "event": "Demo MLB — Home vs Away",
-                "market": "Home ML",
-                "book": "Demo",
-                "odds": -118,
-                "market_prob": american_to_prob(-118),
-                "model_prob": 0.617,
-                "weather": "Warm / moderate wind",
-                "why": "Illustrative starter + lineup + bullpen edge",
-            },
-            {
-                "event": "Demo MLB — Game Total",
-                "market": "Under 8.5",
-                "book": "Demo",
-                "odds": -105,
-                "market_prob": american_to_prob(-105),
-                "model_prob": 0.575,
-                "weather": "Cool / low wind",
-                "why": "Illustrative run-environment edge",
-            },
-        ]
-    if sport == "NFL":
-        return [
-            {
-                "event": "Demo NFL — Home vs Away",
-                "market": "Home +3.5",
-                "book": "Demo",
-                "odds": -110,
-                "market_prob": american_to_prob(-110),
-                "model_prob": 0.572,
-                "weather": "Clear",
-                "why": "Illustrative matchup and home-field edge",
-            }
-        ]
-    if sport == "NCAA Football":
-        return [
-            {
-                "event": "Demo NCAA — Ranked Home vs Away",
-                "market": "Home -6.5",
-                "book": "Demo",
-                "odds": -110,
-                "market_prob": american_to_prob(-110),
-                "model_prob": 0.566,
-                "weather": "Clear",
-                "why": "Illustrative talent, matchup and home-field edge",
-            }
-        ]
-    return [
-        {
-            "event": "Demo PGA — Tournament",
-            "market": "Player A Top 20",
-            "book": "Demo",
-            "odds": -110,
-            "market_prob": american_to_prob(-110),
-            "model_prob": 0.595,
-            "weather": "Windy",
-            "why": "Illustrative course-fit and ball-striking edge",
-        },
-        {
-            "event": "Demo PGA — Tournament",
-            "market": "Player B Winner",
-            "book": "Demo",
-            "odds": 4500,
-            "market_prob": american_to_prob(4500),
-            "model_prob": 0.038,
-            "weather": "Windy",
-            "why": "Illustrative dark-horse course-fit edge",
-        },
-    ]
-
-def analyze_bet(row: Dict, sport: str) -> Dict:
-    mp = float(row["market_prob"])
-    p = float(row["model_prob"])
-    edge = (p - mp) * 100
-    ev = ev_per_unit(p, float(row["odds"])) * 100
-    fair = prob_to_american(p)
-
-    confidence = confidence_from_inputs(88, 86, 84)
-    score = edge_score(edge, confidence, 90, 88, 84, 86, min(100, 70 + max(edge, 0) * 4))
-
-    if score >= 80 and edge >= 3:
-        verdict = "BET"
-    elif score >= 70 and edge >= 1.5:
-        verdict = "LEAN"
-    else:
-        verdict = "PASS"
-
-    return {
-        **row,
-        "model_prob": p,
-        "market_prob": mp,
-        "edge": edge,
-        "ev": ev,
-        "fair_odds": fair,
-        "confidence": confidence,
-        "edge_score": score,
-        "verdict": verdict,
-    }
-
-# ----------------------------
-# Odds API parsing
-# ----------------------------
-
-def parse_h2h(events: List[Dict]) -> List[Dict]:
-    rows = []
-    for event in events:
-        home = event.get("home_team", "")
-        away = event.get("away_team", "")
-        for book in event.get("bookmakers", []):
-            for market in book.get("markets", []):
-                if market.get("key") != "h2h":
-                    continue
-                outcomes = market.get("outcomes", [])
-                for out in outcomes:
-                    odds = out.get("price")
-                    if odds is None:
-                        continue
-                    rows.append({
-                        "event": f"{away} @ {home}",
-                        "market": f"{out.get('name')} ML",
-                        "book": book.get("title", "Book"),
-                        "odds": odds,
-                        "market_prob": american_to_prob(odds),
-                        "model_prob": american_to_prob(odds),
-                        "weather": "Not linked to venue yet",
-                        "why": "Model awaiting sport-specific feature data",
-                    })
-                break
-    return rows
-
-# ----------------------------
-# UI
-# ----------------------------
-
-st.title("📈 EDGE")
-st.caption("Quantitative sports-betting analytics — probability first, price second.")
+st.title("📈 EDGE MLB v2")
+st.caption("Live MLB schedule + current sportsbook odds + season stats + weather + Monte Carlo model")
 
 with st.sidebar:
-    st.header("Controls")
-    sport = st.selectbox("Sport", list(SPORTS.keys()))
-    mode = st.radio("Data mode", ["Demo / Prototype", "Live Odds API"])
-    min_edge = st.slider("Minimum model edge (%)", 0.0, 15.0, 3.0, 0.5)
-    min_score = st.slider("Minimum Edge Score", 0, 100, 70, 5)
+    game_date = st.date_input("Game date", date.today())
+    min_edge = st.slider("Minimum model edge (%)", 0.0, 15.0, 2.5, .5)
+    min_score = st.slider("Minimum Edge Score", 0, 100, 65, 5)
+    sims = st.select_slider("Simulations", [2500, 5000, 10000, 25000], value=10000)
     st.divider()
-    st.write("**Model philosophy**")
-    st.write("Find positive expected value, not simply likely winners.")
-    st.caption("This is an analytical prototype, not a guarantee of profit.")
+    st.caption("v2 is a transparent research prototype. Historical calibration is still required.")
 
-if mode == "Live Odds API":
-    events, err = fetch_odds(SPORTS[sport])
-    if err:
-        st.warning(err)
-    rows = parse_h2h(events)
-    if not rows:
-        st.info("No live moneyline markets returned. Demo data is shown so the interface remains testable.")
-        rows = demo_bets(sport)
+try:
+    games = games_for(game_date.isoformat())
+except Exception as e:
+    games = []
+    st.error(f"MLB data error: {e}")
+
+events, odds_error = odds_feed()
+if odds_error:
+    st.warning(odds_error)
+
+lookup = {
+    (norm(e.get("away_team", "")), norm(e.get("home_team", ""))): e
+    for e in events
+}
+
+rows = []
+for g in games:
+    try:
+        hr, ar, meta = projection(g)
+        hw, aw, over = simulate(hr, ar, sims, int(g["gamePk"] or 1))
+    except Exception as ex:
+        continue
+
+    event = lookup.get((norm(g["away"]), norm(g["home"])))
+    if not event:
+        continue
+
+    for team, (price, book) in best_moneylines(event):
+        model_p = hw if norm(team) == norm(g["home"]) else aw
+        market_p = implied_prob(price)
+        edge = (model_p - market_p) * 100
+        data_q = 84 if g["hp_id"] and g["ap_id"] else 58
+        sc = edge_score(edge, data_q, 78, 88, 72)
+        rows.append({
+            "game": f'{g["away"]} @ {g["home"]}',
+            "selection": f"{team} ML",
+            "book": book,
+            "odds": price,
+            "model_prob": model_p,
+            "market_prob": market_p,
+            "edge": edge,
+            "fair": fair_price(model_p),
+            "ev": ev_pct(model_p, price),
+            "score": sc,
+            "pitchers": f'{g["ap"] or "TBD"} / {g["hp"] or "TBD"}',
+            "weather": meta["weather"]
+        })
+
+df = pd.DataFrame(rows)
+if not df.empty:
+    candidates = df[(df.edge >= min_edge) & (df.score >= min_score)].sort_values(
+        ["score", "edge"], ascending=False
+    )
 else:
-    rows = demo_bets(sport)
+    candidates = pd.DataFrame()
 
-results = [analyze_bet(r, sport) for r in rows]
-df = pd.DataFrame(results)
-df = df[(df["edge"] >= min_edge) & (df["edge_score"] >= min_score)].sort_values(
-    ["edge_score", "edge"], ascending=False
-)
-
-# Summary cards
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Opportunities", len(df))
-c2.metric("Best Edge", f"{df['edge'].max():.1f}%" if len(df) else "—")
-c3.metric("Best Score", f"{int(df['edge_score'].max())}" if len(df) else "—")
-c4.metric("Avg Confidence", f"{df['confidence'].mean():.0f}" if len(df) else "—")
+c1.metric("MLB games", len(games))
+c2.metric("Markets analyzed", len(df))
+c3.metric("Best edge", f"{candidates.edge.max():.1f}%" if not candidates.empty else "—")
+c4.metric("Best score", int(candidates.score.max()) if not candidates.empty else "—")
 
-st.subheader("🔥 Today's strongest opportunities")
+st.subheader("🔥 Today's strongest MLB edges")
 
-if df.empty:
-    st.success("NO BET — nothing currently clears the selected thresholds.")
+if candidates.empty:
+    st.success("NO BET — no current moneyline market clears your selected thresholds.")
 else:
-    display = df[
-        ["event", "market", "book", "odds", "model_prob", "market_prob", "edge", "fair_odds", "edge_score", "confidence", "verdict"]
-    ].copy()
-    display["model_prob"] = (display["model_prob"] * 100).round(1).astype(str) + "%"
-    display["market_prob"] = (display["market_prob"] * 100).round(1).astype(str) + "%"
-    display["edge"] = display["edge"].round(1).astype(str) + "%"
-    display["fair_odds"] = display["fair_odds"].astype(int)
-    display["edge_score"] = display["edge_score"].astype(int)
-    display["confidence"] = display["confidence"].astype(int)
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-    st.divider()
-    for _, r in df.iterrows():
+    for _, r in candidates.head(10).iterrows():
         with st.container(border=True):
-            a, b, c = st.columns([3, 1, 1])
-            a.markdown(f"### {r['market']} — {r['event']}")
-            b.metric("EDGE SCORE", int(r["edge_score"]))
-            c.metric("Confidence", int(r["confidence"]))
+            a, b, c = st.columns([4, 1, 1])
+            a.markdown(f"### {r.selection} — {r.game}")
+            b.metric("EDGE", f"{r.edge:+.1f}%")
+            c.metric("SCORE", int(r.score))
             st.write(
-                f"**Market:** {r['odds']:+g}  ·  "
-                f"**Model:** {r['model_prob']*100:.1f}%  ·  "
-                f"**Implied:** {r['market_prob']*100:.1f}%  ·  "
-                f"**Edge:** {r['edge']:+.1f}%  ·  "
-                f"**Fair price:** {r['fair_odds']:+d}  ·  "
-                f"**EV:** {r['ev']:+.1f}%"
+                f'**Best price:** {r.odds:+g} at {r.book} · '
+                f'**Model:** {r.model_prob*100:.1f}% · '
+                f'**Market:** {r.market_prob*100:.1f}% · '
+                f'**Fair:** {r.fair:+d} · **EV:** {r.ev:+.1f}%'
             )
-            st.write(f"**Verdict: {r['verdict']}**")
-            st.caption(f"Why: {r['why']} | Conditions: {r['weather']}")
+            st.write(f'**Pitchers:** {r.pitchers} · **Weather:** {r.weather}')
+            st.caption("Signal only; not a guarantee of profit. Model coefficients are not yet historically calibrated.")
 
-# Parlay section
-st.subheader("💰 Parlay Lab")
-st.write("The production version will evaluate joint probability and correlation rather than simply stacking the highest Edge Scores.")
-
-if len(df) >= 2:
-    legs = df.head(3)
-    joint_p = 1.0
-    for _, r in legs.iterrows():
-        joint_p *= float(r["model_prob"])
-    # Illustrative independent-leg payout calculation
-    combined_decimal = 1.0
-    for _, r in legs.iterrows():
-        combined_decimal *= american_to_decimal(float(r["odds"]))
-    fair_parlay_odds = prob_to_american(joint_p)
-    implied = 1 / combined_decimal
-    parlay_edge = (joint_p - implied) * 100
-    st.write(f"**Suggested legs:** {len(legs)}")
-    for _, r in legs.iterrows():
-        st.write(f"- {r['market']} ({r['odds']:+g}) — model {r['model_prob']*100:.1f}%")
-    st.write(
-        f"**Illustrative joint probability:** {joint_p*100:.1f}%  ·  "
-        f"**Fair parlay price:** {fair_parlay_odds:+d}  ·  "
-        f"**Model edge:** {parlay_edge:+.1f}%"
-    )
+st.subheader("📋 Full market board")
+if not df.empty:
+    board = df.copy()
+    board["model_prob"] = (board["model_prob"]*100).round(1).astype(str) + "%"
+    board["market_prob"] = (board["market_prob"]*100).round(1).astype(str) + "%"
+    board["edge"] = board["edge"].round(1).astype(str) + "%"
+    board["ev"] = board["ev"].round(1).astype(str) + "%"
+    st.dataframe(board, use_container_width=True, hide_index=True)
 else:
-    st.info("Need at least two qualifying legs for a parlay preview.")
+    st.info("No matching live MLB odds were returned.")
 
-# PGA dark horse
-if sport == "PGA Tour":
-    st.subheader("🐎 Dark Horse Board")
-    pga = pd.DataFrame(results)
-    pga["dark_horse_score"] = (
-        (pga["model_prob"] - pga["market_prob"]).clip(lower=0) * 100 * 25
-        + pga["confidence"] * 0.45
-        + pga["edge_score"] * 0.30
-    ).clip(0, 100).round(0).astype(int)
-    pga = pga.sort_values("dark_horse_score", ascending=False)
-    st.dataframe(
-        pga[["market", "odds", "model_prob", "market_prob", "edge", "dark_horse_score"]]
-        .assign(
-            model_prob=lambda x: (x.model_prob*100).round(1).astype(str)+"%",
-            market_prob=lambda x: (x.market_prob*100).round(1).astype(str)+"%",
-            edge=lambda x: x.edge.round(1).astype(str)+"%"
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# Chat-style analyst
-st.subheader("💬 AI Analyst")
-question = st.text_input(
-    "Ask the analyst",
-    placeholder="What are the strongest bets today? / Who is the best PGA dark horse?"
-)
+st.subheader("💬 EDGE Analyst")
+question = st.text_input("Ask", "What are the strongest MLB bets today?")
 if question:
-    q = question.lower()
-    if "dark horse" in q and sport == "PGA Tour":
-        top = pd.DataFrame(results).sort_values("edge_score", ascending=False).iloc[0]
-        st.success(
-            f"Top prototype dark horse: **{top['market']}** at **{top['odds']:+g}**. "
-            f"Model probability {top['model_prob']*100:.1f}% vs market {top['market_prob']*100:.1f}%, "
-            f"Edge {top['edge']:+.1f}%, Edge Score {top['edge_score']}/100."
-        )
-    elif "parlay" in q:
-        st.info("Use Parlay Lab above. Production v2 will optimize the legs jointly for probability, correlation, price and EV.")
+    if candidates.empty:
+        st.info("The model does not identify a qualifying bet under the current thresholds.")
     else:
-        st.info("Prototype analyst: use the ranked opportunities above. In the production version, this box will call the model API and explain the quantitative evidence behind each recommendation.")
+        r = candidates.iloc[0]
+        st.info(
+            f"Top signal: {r.selection} at {r.odds:+g}. "
+            f"Model probability {r.model_prob*100:.1f}% vs market {r.market_prob*100:.1f}%, "
+            f"estimated edge {r.edge:+.1f} percentage points, fair price {r.fair:+d}."
+        )
 
-st.divider()
-st.caption(
-    "EDGE MVP v1.0 — Demo calculations are intentionally conservative placeholders. "
-    "Do not treat demo outputs as live betting advice. A production model must be trained, calibrated, backtested, and validated out-of-sample."
-)
+with st.expander("🔎 Data / model audit"):
+    st.write(f"MLB games found: {len(games)}")
+    st.write(f"Odds events returned: {len(events)}")
+    st.write(f"Simulations per game: {sims}")
+    st.write("Data sources: MLB Stats API · The Odds API · Open-Meteo")
+    st.warning("Before real-money use, this model needs historical backtesting, probability calibration, closing-line-value tracking, and out-of-sample validation.")
