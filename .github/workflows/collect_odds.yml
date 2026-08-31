@@ -1,0 +1,45 @@
+name: Collect MLB odds snapshots
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 16 * * *"
+    - cron: "17 19 * * *"
+    - cron: "17 22 * * *"
+    - cron: "17 1 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Collect current MLB odds
+        env:
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+        run: python collector.py
+
+      - name: Commit snapshot if changed
+        run: |
+          git config user.name "EDGE Odds Collector"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/odds_snapshots.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Collect MLB odds snapshot"
+            git push
+          fi
