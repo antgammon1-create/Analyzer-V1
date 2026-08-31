@@ -129,13 +129,43 @@ def season_games(league, year):
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=1800)
-def team_ratings(league, year):
-    df = season_games(league, year)
+def season_games(league, year, season_type=2):
+    data = espn_scoreboard(league, str(year), 1000)
+    rows = []
+    for ev in data.get("events", []):
+        season = ev.get("season", {})
+        ev_type = season.get("type")
+        if season_type is not None and ev_type != season_type:
+            continue
+        comp = (ev.get("competitions") or [{}])[0]
+        status = comp.get("status", {}).get("type", {})
+        if not status.get("completed"):
+            continue
+        competitors = comp.get("competitors", [])
+        if len(competitors) != 2:
+            continue
+        home = next((x for x in competitors if x.get("homeAway") == "home"), None)
+        away = next((x for x in competitors if x.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
+        try:
+            hs, as_ = float(home.get("score")), float(away.get("score"))
+        except Exception:
+            continue
+        rows.append({
+            "date": ev.get("date"),
+            "home": home.get("team", {}).get("displayName"),
+            "away": away.get("team", {}).get("displayName"),
+            "home_score": hs,
+            "away_score": as_,
+        })
+    return pd.DataFrame(rows)
+
+def srs_from_games(df):
     if df.empty:
         return {}, {}
     teams = sorted(set(df.home) | set(df.away))
     rating = {t: 0.0 for t in teams}
-    # Simple iterative SRS: average adjusted scoring margin.
     for _ in range(12):
         new = {}
         for t in teams:
@@ -166,6 +196,102 @@ def team_ratings(league, year):
             "win_pct": wins/n if n else 0.5,
         }
     return rating, stats
+
+@st.cache_data(ttl=1800)
+def team_ratings_blended(league, year):
+    # Regular-season only. Preseason games are intentionally excluded.
+    prev_df = season_games(league, year-1, season_type=2)
+    curr_df = season_games(league, year, season_type=2)
+    prev_rating, prev_stats = srs_from_games(prev_df)
+    curr_rating, curr_stats = srs_from_games(curr_df)
+
+    teams = sorted(set(prev_rating) | set(curr_rating))
+    rating, stats = {}, {}
+    for t in teams:
+        n = curr_stats.get(t, {}).get("games", 0)
+        # Start the year anchored to last season, then transition toward current season.
+        current_weight = clamp(n / 8.0, 0.0, 1.0)
+        prior_weight = 1.0 - current_weight
+        rating[t] = prior_weight * prev_rating.get(t, 0.0) + current_weight * curr_rating.get(t, prev_rating.get(t, 0.0))
+
+        prev = prev_stats.get(t, {})
+        curr = curr_stats.get(t, {})
+        pf = prior_weight * prev.get("pf", 0.0) + current_weight * curr.get("pf", prev.get("pf", 0.0))
+        pa = prior_weight * prev.get("pa", 0.0) + current_weight * curr.get("pa", prev.get("pa", 0.0))
+        stats[t] = {
+            "games": n,
+            "pf": pf if pf else np.nan,
+            "pa": pa if pa else np.nan,
+            "win_pct": curr.get("win_pct", prev.get("win_pct", 0.5)),
+            "prior_games": prev.get("games", 0),
+        }
+    return rating, stats
+
+@st.cache_data(ttl=900)
+def espn_upcoming_metadata(league, dates):
+    out = {}
+    for d in sorted(set(dates)):
+        try:
+            data = espn_scoreboard(league, d.strftime("%Y%m%d"), 100)
+        except Exception:
+            continue
+        for ev in data.get("events", []):
+            comp = (ev.get("competitions") or [{}])[0]
+            competitors = comp.get("competitors", [])
+            if len(competitors) != 2:
+                continue
+            home = next((x for x in competitors if x.get("homeAway") == "home"), None)
+            away = next((x for x in competitors if x.get("homeAway") == "away"), None)
+            if not home or not away:
+                continue
+            key = (
+                norm_name(away.get("team", {}).get("displayName")),
+                norm_name(home.get("team", {}).get("displayName")),
+                d.isoformat(),
+            )
+            season_type = ev.get("season", {}).get("type")
+            stage = {1: "PRESEASON", 2: "REGULAR", 3: "POSTSEASON"}.get(season_type, "UNKNOWN")
+            week = ev.get("week", {}).get("text") or ev.get("week", {}).get("number")
+            out[key] = {"stage": stage, "week": week}
+    return out
+
+def annotate_and_filter_football_events(odds, league):
+    now = datetime.now(timezone.utc)
+    parsed = []
+    for ev in odds:
+        try:
+            dt = datetime.fromisoformat(ev.get("commence_time","").replace("Z","+00:00"))
+        except Exception:
+            continue
+        if dt < now - timedelta(hours=2):
+            continue
+        parsed.append((dt, ev))
+    if not parsed:
+        return [], [], "No upcoming games"
+
+    dates = [dt.date() for dt,_ in parsed]
+    meta = espn_upcoming_metadata(league, dates)
+    regular, preseason = [], []
+    for dt, ev in parsed:
+        key = (norm_name(ev.get("away_team")), norm_name(ev.get("home_team")), dt.date().isoformat())
+        m = meta.get(key, {"stage":"UNKNOWN","week":None})
+        ev = dict(ev)
+        ev["_stage"] = m["stage"]
+        ev["_week"] = m["week"]
+        if m["stage"] == "PRESEASON":
+            preseason.append((dt, ev))
+        else:
+            regular.append((dt, ev))
+
+    # Main board = the next actual slate, not the entire future board.
+    pool = regular if regular else preseason
+    if not pool:
+        return [], [], "No upcoming games"
+    first_dt = min(dt for dt,_ in pool)
+    slate_end = first_dt + timedelta(days=7)
+    slate = [ev for dt,ev in pool if dt <= slate_end]
+    label = f"{first_dt.strftime('%b %d')} – {slate_end.strftime('%b %d')}"
+    return slate, [ev for _,ev in preseason], label
 
 def consensus_market(event, market_key):
     books = event.get("bookmakers", [])
@@ -231,9 +357,12 @@ def football_model(event, league, ratings, stats):
 
     games_h = sh.get("games", 0) if sh else 0
     games_a = sa.get("games", 0) if sa else 0
+    prior_h = sh.get("prior_games", 0) if sh else 0
+    prior_a = sa.get("prior_games", 0) if sa else 0
     min_games = min(games_h, games_a)
-    quality = int(clamp(45 + min_games*6, 45, 92))
-    reliability = "HIGH" if min_games >= 8 else ("MEDIUM" if min_games >= 4 else "LOW")
+    prior_support = min(prior_h, prior_a)
+    quality = int(clamp(68 + min_games*3 + min(prior_support, 10), 68, 94))
+    reliability = "HIGH" if min_games >= 6 else ("MEDIUM" if prior_support >= 8 else "LOW")
     return expected_margin, expected_total, p_home, quality, reliability, games_h, games_a
 
 def classify(edge, ev, quality, reliability):
@@ -256,9 +385,14 @@ def analyze_football(sport_key, league_label, espn_league):
         return
     now = datetime.now(timezone.utc)
     year = now.year
-    ratings, stats = team_ratings(espn_league, year)
+    ratings, stats = team_ratings_blended(espn_league, year)
+    slate_odds, preseason_odds, slate_label = annotate_and_filter_football_events(odds, espn_league)
+    if not slate_odds:
+        st.info("No upcoming football slate could be matched.")
+        return
+    st.caption(f"Main board: {slate_label}. Preseason is excluded from the betting board.")
     rows = []
-    for ev in odds:
+    for ev in slate_odds:
         c = h2h_consensus(ev)
         if not c:
             continue
@@ -300,20 +434,36 @@ def analyze_football(sport_key, league_label, espn_league):
     c2.metric("Bet candidates", int((df.Signal=="BET CANDIDATE").sum()))
     c3.metric("Watch", int((df.Signal=="WATCH").sum()))
     c4.metric("API remaining", meta.get("remaining") or "—")
-    st.dataframe(df, use_container_width=True, hide_index=True,
-                 column_config={
-                     "Model %": st.column_config.NumberColumn(format="%.1f"),
-                     "Market %": st.column_config.NumberColumn(format="%.1f"),
-                     "Edge %": st.column_config.NumberColumn(format="%+.1f"),
-                     "EV %": st.column_config.NumberColumn(format="%+.1f"),
-                     "Model margin": st.column_config.NumberColumn(format="%+.1f"),
-                     "Model total": st.column_config.NumberColumn(format="%.1f"),
-                 })
-    st.caption("Football model = simple opponent-adjusted scoring-margin (SRS) + home field + season scoring environment. Early-season signals are intentionally downgraded. This is an operational research model, not a proven betting edge.")
+    st.markdown("#### Top moneyline signals")
+    for _, r in df.head(12).iterrows():
+        badge = "🟢" if r["Signal"] == "BET CANDIDATE" else ("🟡" if r["Signal"] == "WATCH" else "⚪")
+        st.markdown(
+            f'**{badge} {r["Signal"]} — {r["Pick"]} {r["Best odds"]}**  \n'
+            f'Edge **{r["Edge %"]:+.1f}%** • EV **{r["EV %"]:+.1f}%** • {r["Reliability"]} • Quality {int(r["Data quality"])}/100'
+        )
+        with st.expander(f'Details: {r["Game"]}'):
+            st.write(f'Model probability: {r["Model %"]:.1f}%')
+            st.write(f'Market no-vig probability: {r["Market %"]:.1f}%')
+            st.write(f'Fair odds: {r["Fair odds"]}')
+            st.write(f'Best book: {r["Book"]}')
+            st.write(f'Model margin: {r["Model margin"]:+.1f}')
+            st.write(f'Model total: {r["Model total"]:.1f}')
+            st.write(f'Books contributing: {int(r["Books"])}')
+    with st.expander("Full moneyline table"):
+        st.dataframe(df, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Model %": st.column_config.NumberColumn(format="%.1f"),
+                         "Market %": st.column_config.NumberColumn(format="%.1f"),
+                         "Edge %": st.column_config.NumberColumn(format="%+.1f"),
+                         "EV %": st.column_config.NumberColumn(format="%+.1f"),
+                         "Model margin": st.column_config.NumberColumn(format="%+.1f"),
+                         "Model total": st.column_config.NumberColumn(format="%.1f"),
+                     })
+    st.caption("Football model = prior-season regular-season SRS blended into current-season regular-season SRS + home field + scoring environment. Preseason results are excluded. Early-season signals remain downgraded. This is an operational research model, not a proven betting edge.")
 
     st.markdown("#### Spread & total model")
     market_rows = []
-    for ev in odds:
+    for ev in slate_odds:
         margin, model_total, _, quality, reliability, *_ = football_model(ev, espn_league, ratings, stats)
         for mk in ["spreads","totals"]:
             probs, best, nbooks = consensus_market(ev, mk)
@@ -357,14 +507,38 @@ def analyze_football(sport_key, league_label, espn_league):
                     "Signal": classify(edge, evu, quality, reliability),
                 })
     if market_rows:
-        mdf = pd.DataFrame(market_rows).sort_values("Edge %", ascending=False)
-        st.dataframe(mdf.head(40), use_container_width=True, hide_index=True,
-                     column_config={
-                         "Model %": st.column_config.NumberColumn(format="%.1f"),
-                         "Price implied %": st.column_config.NumberColumn(format="%.1f"),
-                         "Edge %": st.column_config.NumberColumn(format="%+.1f"),
-                         "EV %": st.column_config.NumberColumn(format="%+.1f"),
-                     })
+        mdf = pd.DataFrame(market_rows).sort_values(["Signal","Edge %"], ascending=[True,False])
+        sig_order = {"BET CANDIDATE":0,"WATCH":1,"PASS":2}
+        mdf["_o"] = mdf["Signal"].map(sig_order).fillna(3)
+        mdf = mdf.sort_values(["_o","Edge %"], ascending=[True,False]).drop(columns="_o")
+        for _, r in mdf.head(12).iterrows():
+            badge = "🟢" if r["Signal"] == "BET CANDIDATE" else ("🟡" if r["Signal"] == "WATCH" else "⚪")
+            st.markdown(
+                f'**{badge} {r["Signal"]} — {r["Pick"]} {r["Best odds"]}**  \n'
+                f'{r["Market"]} • Edge **{r["Edge %"]:+.1f}%** • EV **{r["EV %"]:+.1f}%** • {r["Reliability"]}'
+            )
+            with st.expander(f'Details: {r["Game"]}'):
+                st.write(f'Model probability: {r["Model %"]:.1f}%')
+                st.write(f'Price-implied probability: {r["Price implied %"]:.1f}%')
+                st.write(f'Best book: {r["Book"]}')
+                st.write(f'Data quality: {int(r["Data quality"])}/100')
+        with st.expander("Full spread & total table"):
+            st.dataframe(mdf.head(50), use_container_width=True, hide_index=True,
+                         column_config={
+                             "Model %": st.column_config.NumberColumn(format="%.1f"),
+                             "Price implied %": st.column_config.NumberColumn(format="%.1f"),
+                             "Edge %": st.column_config.NumberColumn(format="%+.1f"),
+                             "EV %": st.column_config.NumberColumn(format="%+.1f"),
+                         })
+
+    if preseason_odds:
+        with st.expander(f"Preseason games excluded ({len(preseason_odds)})"):
+            st.warning("Preseason is shown for awareness only. EDGE does not issue BET CANDIDATE labels for preseason games because playing-time and roster uncertainty are too high.")
+            pre = pd.DataFrame([{
+                "Game": f'{e["away_team"]} @ {e["home_team"]}',
+                "Start": e.get("commence_time"),
+            } for e in preseason_odds])
+            st.dataframe(pre, hide_index=True, use_container_width=True)
 
 @st.cache_data(ttl=900)
 def golf_scoreboard(year):
