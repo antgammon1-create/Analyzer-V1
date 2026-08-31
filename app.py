@@ -1,425 +1,511 @@
 
-import os, math, random
-from datetime import date, datetime, timedelta, timezone
+import math
+import re
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, log_loss
 
-st.set_page_config(page_title="EDGE v4.2 Free Validation", page_icon="📈", layout="wide")
+st.set_page_config(page_title="EDGE v5 Multi-Sport", page_icon="📊", layout="wide")
 
-MLB = "https://statsapi.mlb.com/api/v1"
-SNAPSHOT_FILE = "data/odds_snapshots.csv"
+ODDS_BASE = "https://api.the-odds-api.com/v4"
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+DATA_FILE = Path("data/market_snapshots.csv")
 
-def get_json(url, params=None):
-    r = requests.get(url, params=params or {}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
-def norm(s):
-    return "".join(c.lower() for c in (s or "") if c.isalnum())
+API_KEY = secret("THE_ODDS_API_KEY", "")
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-def implied_prob(odds):
-    odds = float(odds)
-    return 100/(odds+100) if odds >= 0 else -odds/(-odds+100)
+def american_to_prob(price):
+    try:
+        p = float(price)
+    except Exception:
+        return np.nan
+    if p < 0:
+        return (-p) / ((-p) + 100.0)
+    if p > 0:
+        return 100.0 / (p + 100.0)
+    return np.nan
 
-def american_decimal(odds):
-    odds = float(odds)
-    return 1 + (odds/100 if odds >= 0 else 100/abs(odds))
+def prob_to_american(p):
+    p = clamp(float(p), 0.001, 0.999)
+    if p >= 0.5:
+        return int(round(-100.0 * p / (1.0 - p)))
+    return int(round(100.0 * (1.0 - p) / p))
 
-def season_start(ds):
-    return f"{datetime.fromisoformat(ds).year}-03-20"
+def ev_per_unit(p, price):
+    try:
+        price = float(price)
+    except Exception:
+        return np.nan
+    profit = price / 100.0 if price > 0 else 100.0 / abs(price)
+    return p * profit - (1.0 - p)
 
-def day_before(ds):
-    return (datetime.fromisoformat(ds)-timedelta(days=1)).date().isoformat()
+def fmt_odds(x):
+    if pd.isna(x):
+        return "—"
+    x = int(round(float(x)))
+    return f"+{x}" if x > 0 else str(x)
 
-@st.cache_data(ttl=300)
-def schedule(ds):
-    return get_json(
-        f"{MLB}/schedule",
-        {"sportId":1, "date":ds, "hydrate":"probablePitcher,team"}
-    ).get("dates", [])
+def norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
-def games_for(ds):
-    out=[]
-    for day in schedule(ds):
-        for g in day.get("games",[]):
-            h=g.get("teams",{}).get("home",{})
-            a=g.get("teams",{}).get("away",{})
-            out.append({
-                "gamePk":g.get("gamePk"),
-                "gameDate":g.get("gameDate"),
-                "home":h.get("team",{}).get("name","Home"),
-                "home_id":h.get("team",{}).get("id"),
-                "home_score":h.get("score"),
-                "away":a.get("team",{}).get("name","Away"),
-                "away_id":a.get("team",{}).get("id"),
-                "away_score":a.get("score"),
-                "hp_id":(h.get("probablePitcher") or {}).get("id"),
-                "ap_id":(a.get("probablePitcher") or {}).get("id"),
+@st.cache_data(ttl=180)
+def get_odds(sport_key, markets="h2h,spreads,totals"):
+    if not API_KEY:
+        return [], {"error": "THE_ODDS_API_KEY is missing from Streamlit Secrets."}
+    url = f"{ODDS_BASE}/sports/{sport_key}/odds"
+    params = {
+        "apiKey": API_KEY,
+        "regions": "us",
+        "markets": markets,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    r = requests.get(url, params=params, timeout=25)
+    meta = {
+        "status": r.status_code,
+        "remaining": r.headers.get("x-requests-remaining"),
+        "used": r.headers.get("x-requests-used"),
+    }
+    if r.status_code != 200:
+        meta["error"] = r.text[:500]
+        return [], meta
+    return r.json(), meta
+
+@st.cache_data(ttl=3600)
+def get_sports():
+    if not API_KEY:
+        return []
+    r = requests.get(f"{ODDS_BASE}/sports", params={"apiKey": API_KEY, "all": "true"}, timeout=20)
+    return r.json() if r.status_code == 200 else []
+
+@st.cache_data(ttl=1800)
+def espn_scoreboard(league, dates=None, limit=1000):
+    url = f"{ESPN_BASE}/football/{league}/scoreboard"
+    params = {"limit": limit}
+    if dates:
+        params["dates"] = dates
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def season_games(league, year):
+    data = espn_scoreboard(league, str(year), 1000)
+    rows = []
+    for ev in data.get("events", []):
+        comp = (ev.get("competitions") or [{}])[0]
+        status = comp.get("status", {}).get("type", {})
+        if not status.get("completed"):
+            continue
+        competitors = comp.get("competitors", [])
+        if len(competitors) != 2:
+            continue
+        home = next((x for x in competitors if x.get("homeAway") == "home"), None)
+        away = next((x for x in competitors if x.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
+        try:
+            hs, as_ = float(home.get("score")), float(away.get("score"))
+        except Exception:
+            continue
+        rows.append({
+            "date": ev.get("date"),
+            "home": home.get("team", {}).get("displayName"),
+            "away": away.get("team", {}).get("displayName"),
+            "home_score": hs,
+            "away_score": as_,
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=1800)
+def team_ratings(league, year):
+    df = season_games(league, year)
+    if df.empty:
+        return {}, {}
+    teams = sorted(set(df.home) | set(df.away))
+    rating = {t: 0.0 for t in teams}
+    # Simple iterative SRS: average adjusted scoring margin.
+    for _ in range(12):
+        new = {}
+        for t in teams:
+            vals = []
+            for r in df.itertuples():
+                if r.home == t:
+                    vals.append((r.home_score-r.away_score) + rating.get(r.away, 0))
+                elif r.away == t:
+                    vals.append((r.away_score-r.home_score) + rating.get(r.home, 0))
+            new[t] = float(np.mean(vals)) if vals else 0.0
+        mean_r = float(np.mean(list(new.values()))) if new else 0.0
+        rating = {k: v-mean_r for k,v in new.items()}
+    stats = {}
+    for t in teams:
+        pts_for, pts_against, wins, n = [], [], 0, 0
+        for r in df.itertuples():
+            if r.home == t:
+                pf, pa = r.home_score, r.away_score
+            elif r.away == t:
+                pf, pa = r.away_score, r.home_score
+            else:
+                continue
+            pts_for.append(pf); pts_against.append(pa); n += 1; wins += int(pf > pa)
+        stats[t] = {
+            "games": n,
+            "pf": float(np.mean(pts_for)) if pts_for else np.nan,
+            "pa": float(np.mean(pts_against)) if pts_against else np.nan,
+            "win_pct": wins/n if n else 0.5,
+        }
+    return rating, stats
+
+def consensus_market(event, market_key):
+    books = event.get("bookmakers", [])
+    outcomes_by_key = {}
+    best = {}
+    book_count = 0
+    for b in books:
+        market = next((m for m in b.get("markets", []) if m.get("key") == market_key), None)
+        if not market:
+            continue
+        book_count += 1
+        for o in market.get("outcomes", []):
+            name = o.get("name")
+            point = o.get("point")
+            key = (name, point)
+            price = o.get("price")
+            if price is None:
+                continue
+            outcomes_by_key.setdefault(key, []).append(american_to_prob(price))
+            old = best.get(key)
+            if old is None or float(price) > old["price"]:
+                best[key] = {"price": float(price), "book": b.get("title", b.get("key",""))}
+    return outcomes_by_key, best, book_count
+
+def h2h_consensus(event):
+    probs, best, nbooks = consensus_market(event, "h2h")
+    home, away = event.get("home_team"), event.get("away_team")
+    hp = [p for (n,_), arr in probs.items() if n == home for p in arr]
+    ap = [p for (n,_), arr in probs.items() if n == away for p in arr]
+    if not hp or not ap:
+        return None
+    raw_h, raw_a = float(np.mean(hp)), float(np.mean(ap))
+    s = raw_h + raw_a
+    return {
+        "home_market": raw_h/s,
+        "away_market": raw_a/s,
+        "home_best": best.get((home, None), {}),
+        "away_best": best.get((away, None), {}),
+        "books": nbooks
+    }
+
+def normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def football_model(event, league, ratings, stats):
+    home, away = event["home_team"], event["away_team"]
+    rh, ra = ratings.get(home, 0.0), ratings.get(away, 0.0)
+    hfa = 2.0 if league == "nfl" else 2.5
+    scale = 13.5 if league == "nfl" else 17.0
+    expected_margin = rh - ra + hfa
+    p_home = normal_cdf(expected_margin / scale)
+
+    sh, sa = stats.get(home, {}), stats.get(away, {})
+    league_total = 44.5 if league == "nfl" else 55.0
+    vals = []
+    if sh:
+        vals.extend([sh.get("pf"), sh.get("pa")])
+    if sa:
+        vals.extend([sa.get("pf"), sa.get("pa")])
+    vals = [v for v in vals if v is not None and not pd.isna(v)]
+    expected_total = float(np.mean(vals))*2 if vals else league_total
+    expected_total = 0.65*expected_total + 0.35*league_total
+
+    games_h = sh.get("games", 0) if sh else 0
+    games_a = sa.get("games", 0) if sa else 0
+    min_games = min(games_h, games_a)
+    quality = int(clamp(45 + min_games*6, 45, 92))
+    reliability = "HIGH" if min_games >= 8 else ("MEDIUM" if min_games >= 4 else "LOW")
+    return expected_margin, expected_total, p_home, quality, reliability, games_h, games_a
+
+def classify(edge, ev, quality, reliability):
+    if quality < 65 or reliability == "LOW":
+        return "PASS"
+    if edge >= 0.075 and ev >= 0.08 and quality >= 80:
+        return "BET CANDIDATE"
+    if edge >= 0.05 and ev >= 0.05:
+        return "WATCH"
+    return "PASS"
+
+def analyze_football(sport_key, league_label, espn_league):
+    st.subheader(f"🏈 {league_label} — Current Betting Board")
+    odds, meta = get_odds(sport_key)
+    if meta.get("error"):
+        st.error(meta["error"])
+        return
+    if not odds:
+        st.info("No current games/odds were returned.")
+        return
+    now = datetime.now(timezone.utc)
+    year = now.year
+    ratings, stats = team_ratings(espn_league, year)
+    rows = []
+    for ev in odds:
+        c = h2h_consensus(ev)
+        if not c:
+            continue
+        margin, total, p_home, quality, reliability, gh, ga = football_model(ev, espn_league, ratings, stats)
+        for side, p_model, p_market, best in [
+            (ev["home_team"], p_home, c["home_market"], c["home_best"]),
+            (ev["away_team"], 1-p_home, c["away_market"], c["away_best"]),
+        ]:
+            price = best.get("price", np.nan)
+            edge = p_model-p_market
+            evu = ev_per_unit(p_model, price)
+            rows.append({
+                "Game": f'{ev["away_team"]} @ {ev["home_team"]}',
+                "Pick": f"{side} ML",
+                "Model %": p_model*100,
+                "Market %": p_market*100,
+                "Edge %": edge*100,
+                "Best odds": fmt_odds(price),
+                "Book": best.get("book","—"),
+                "EV %": evu*100 if not pd.isna(evu) else np.nan,
+                "Fair odds": fmt_odds(prob_to_american(p_model)),
+                "Model margin": margin if side == ev["home_team"] else -margin,
+                "Model total": total,
+                "Data quality": quality,
+                "Reliability": reliability,
+                "Books": c["books"],
+                "Signal": classify(edge, evu if not pd.isna(evu) else -1, quality, reliability),
+                "Start": ev.get("commence_time"),
             })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No two-way moneyline markets could be analyzed.")
+        return
+    order = {"BET CANDIDATE":0, "WATCH":1, "PASS":2}
+    df["_o"] = df["Signal"].map(order).fillna(3)
+    df = df.sort_values(["_o","Edge %"], ascending=[True,False]).drop(columns="_o")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Games", df["Game"].nunique())
+    c2.metric("Bet candidates", int((df.Signal=="BET CANDIDATE").sum()))
+    c3.metric("Watch", int((df.Signal=="WATCH").sum()))
+    c4.metric("API remaining", meta.get("remaining") or "—")
+    st.dataframe(df, use_container_width=True, hide_index=True,
+                 column_config={
+                     "Model %": st.column_config.NumberColumn(format="%.1f"),
+                     "Market %": st.column_config.NumberColumn(format="%.1f"),
+                     "Edge %": st.column_config.NumberColumn(format="%+.1f"),
+                     "EV %": st.column_config.NumberColumn(format="%+.1f"),
+                     "Model margin": st.column_config.NumberColumn(format="%+.1f"),
+                     "Model total": st.column_config.NumberColumn(format="%.1f"),
+                 })
+    st.caption("Football model = simple opponent-adjusted scoring-margin (SRS) + home field + season scoring environment. Early-season signals are intentionally downgraded. This is an operational research model, not a proven betting edge.")
+
+    st.markdown("#### Spread & total model")
+    market_rows = []
+    for ev in odds:
+        margin, model_total, _, quality, reliability, *_ = football_model(ev, espn_league, ratings, stats)
+        for mk in ["spreads","totals"]:
+            probs, best, nbooks = consensus_market(ev, mk)
+            if not probs:
+                continue
+            # Evaluate each distinct line using best available price for that exact outcome/point.
+            for (name, point), info in best.items():
+                price = info["price"]
+                if point is None:
+                    continue
+                if mk == "spreads":
+                    if name not in (ev["home_team"], ev["away_team"]):
+                        continue
+                    model_margin_side = margin if name == ev["home_team"] else -margin
+                    cover_p = normal_cdf((model_margin_side + float(point)) / (13.5 if espn_league=="nfl" else 17.0))
+                    pick = f"{name} {float(point):+g}"
+                else:
+                    sigma = 13.0 if espn_league=="nfl" else 17.0
+                    if name.lower() == "over":
+                        cover_p = normal_cdf((model_total-float(point))/sigma)
+                    elif name.lower() == "under":
+                        cover_p = normal_cdf((float(point)-model_total)/sigma)
+                    else:
+                        continue
+                    pick = f"{name} {float(point):g}"
+                imp = american_to_prob(price)
+                edge = cover_p - imp
+                evu = ev_per_unit(cover_p, price)
+                market_rows.append({
+                    "Game": f'{ev["away_team"]} @ {ev["home_team"]}',
+                    "Market": "Spread" if mk=="spreads" else "Total",
+                    "Pick": pick,
+                    "Model %": cover_p*100,
+                    "Price implied %": imp*100,
+                    "Edge %": edge*100,
+                    "Best odds": fmt_odds(price),
+                    "Book": info["book"],
+                    "EV %": evu*100,
+                    "Data quality": quality,
+                    "Reliability": reliability,
+                    "Signal": classify(edge, evu, quality, reliability),
+                })
+    if market_rows:
+        mdf = pd.DataFrame(market_rows).sort_values("Edge %", ascending=False)
+        st.dataframe(mdf.head(40), use_container_width=True, hide_index=True,
+                     column_config={
+                         "Model %": st.column_config.NumberColumn(format="%.1f"),
+                         "Price implied %": st.column_config.NumberColumn(format="%.1f"),
+                         "Edge %": st.column_config.NumberColumn(format="%+.1f"),
+                         "EV %": st.column_config.NumberColumn(format="%+.1f"),
+                     })
+
+@st.cache_data(ttl=900)
+def golf_scoreboard(year):
+    url = f"{ESPN_BASE}/golf/pga/scoreboard"
+    r = requests.get(url, params={"dates": str(year), "limit": 100}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def golf_current_event(data):
+    events = data.get("events", [])
+    now = datetime.now(timezone.utc)
+    def dt(e):
+        try: return datetime.fromisoformat(e.get("date","").replace("Z","+00:00"))
+        except: return now + timedelta(days=999)
+    active = [e for e in events if not (e.get("status",{}).get("type",{}).get("completed"))]
+    if active:
+        return sorted(active, key=lambda e: abs((dt(e)-now).total_seconds()))[0]
+    return sorted(events, key=lambda e: abs((dt(e)-now).total_seconds()))[0] if events else None
+
+def parse_golf_field(event):
+    comps = event.get("competitions") or []
+    if not comps:
+        return []
+    competitors = comps[0].get("competitors") or []
+    rows=[]
+    for c in competitors:
+        a=c.get("athlete",{})
+        rows.append({
+            "player": a.get("displayName"),
+            "rank": a.get("rank") or a.get("position"),
+            "score": c.get("score"),
+            "status": c.get("status",{}).get("type",{}).get("description",""),
+        })
+    return [r for r in rows if r["player"]]
+
+def golf_market_events():
+    sports = get_sports()
+    keys = [s["key"] for s in sports if str(s.get("group","")).lower()=="golf" and s.get("active")]
+    out=[]
+    for key in keys:
+        evs, meta = get_odds(key, "outrights")
+        if not meta.get("error"):
+            for ev in evs:
+                ev["_sport_key"] = key
+                ev["_sport_title"] = next((s.get("title") for s in sports if s.get("key")==key), key)
+                out.append(ev)
     return out
 
-@st.cache_data(ttl=1800)
-def pitcher_range(pid,start,end):
-    if not pid:return {}
+def analyze_golf():
+    st.subheader("⛳ PGA Golf")
+    year=datetime.now(timezone.utc).year
     try:
-        d=get_json(
-            f"{MLB}/people/{pid}/stats",
-            {"stats":"byDateRange","group":"pitching","startDate":start,"endDate":end}
-        )
-        splits=d.get("stats",[{}])[0].get("splits") or []
-        s=splits[0].get("stat",{}) if splits else {}
-    except Exception:
-        s={}
-    return {
-        "era":float(s.get("era",4.3) or 4.3),
-        "whip":float(s.get("whip",1.3) or 1.3),
-        "k9":float(s.get("strikeoutsPer9Inn",8.5) or 8.5),
-        "bb9":float(s.get("walksPer9Inn",3.2) or 3.2),
-        "hr9":float(s.get("homeRunsPer9",1.2) or 1.2),
-        "innings":float(s.get("inningsPitched",0) or 0),
-    }
+        data=golf_scoreboard(year)
+    except Exception as e:
+        st.error(f"Could not load ESPN golf data: {e}")
+        return
+    event=golf_current_event(data)
+    if not event:
+        st.info("No PGA event was returned.")
+        return
+    st.markdown(f"### {event.get('name','Current PGA event')}")
+    st.caption(f"Start: {event.get('date','—')} • Status: {event.get('status',{}).get('type',{}).get('description','—')}")
+    field=parse_golf_field(event)
+    if field:
+        fdf=pd.DataFrame(field)
+        st.dataframe(fdf.head(40), use_container_width=True, hide_index=True)
+    else:
+        st.info("ESPN has not published the field/leaderboard in this event payload yet.")
 
-@st.cache_data(ttl=1800)
-def team_range(tid, group, start, end):
-    if not tid:return {}
-    try:
-        d=get_json(
-            f"{MLB}/teams/{tid}/stats",
-            {"stats":"byDateRange","group":group,"startDate":start,"endDate":end,"sportIds":1}
-        )
-        splits=d.get("stats",[{}])[0].get("splits") or []
-        s=splits[0].get("stat",{}) if splits else {}
-    except Exception:
-        s={}
-    if group=="hitting":
-        return {
-            "obp":float(s.get("obp",.310) or .310),
-            "slg":float(s.get("slg",.400) or .400),
-            "ops":float(s.get("ops",.710) or .710),
-        }
-    return {
-        "era":float(s.get("era",4.2) or 4.2),
-        "whip":float(s.get("whip",1.3) or 1.3),
-        "k9":float(s.get("strikeoutsPer9Inn",8.5) or 8.5),
-    }
+    st.markdown("#### Sportsbook outright markets")
+    markets=golf_market_events()
+    if not markets:
+        st.warning("No golf outright market is currently available from your free odds feed. The Odds API's golf coverage is mainly the four majors, so ordinary weekly PGA Tour events may have no sportsbook market here.")
+        st.info("You can still use the ESPN tournament/leaderboard view above. EDGE will only show a betting-value comparison when a supported golf outright market is actually available.")
+        return
 
-def pitcher_quality(s):
-    if not s:return 0
-    raw=((4.3-s["era"])*.16+(1.3-s["whip"])*.65+
-         (s["k9"]-8.5)*.035+(3.2-s["bb9"])*.035+(1.2-s["hr9"])*.16)
-    shrink=min(1.0,max(0,s.get("innings",0))/80)
-    return clamp(raw*shrink,-1.25,1.25)
-
-def offense_quality(s):
-    if not s:return 0
-    return clamp((s["ops"]-.710)*2.4+(s["obp"]-.310)*1.4+(s["slg"]-.400)*1.2,-1.25,1.25)
-
-def bullpen_proxy(s):
-    if not s:return 0
-    return clamp((4.2-s["era"])*.10+(1.3-s["whip"])*.35+(s["k9"]-8.5)*.02,-.60,.60)
-
-def features_for(g, ds):
-    start,end=season_start(ds),day_before(ds)
-    hp=pitcher_range(g["hp_id"],start,end)
-    ap=pitcher_range(g["ap_id"],start,end)
-    ho=team_range(g["home_id"],"hitting",start,end)
-    ao=team_range(g["away_id"],"hitting",start,end)
-    htp=team_range(g["home_id"],"pitching",start,end)
-    atp=team_range(g["away_id"],"pitching",start,end)
-    return {
-        "home_off":offense_quality(ho),
-        "away_off":offense_quality(ao),
-        "home_sp":pitcher_quality(hp),
-        "away_sp":pitcher_quality(ap),
-        "home_bp":bullpen_proxy(htp),
-        "away_bp":bullpen_proxy(atp),
-        "home_field":1.0,
-    }
-
-def run_projection(f):
-    hr=4.45+.20+.58*f["home_off"]-.72*f["away_sp"]-.18*f["away_bp"]+.05*f["home_sp"]
-    ar=4.45+.58*f["away_off"]-.72*f["home_sp"]-.18*f["home_bp"]+.05*f["away_sp"]
-    return clamp(hr,1.5,8.5),clamp(ar,1.5,8.5)
-
-def poisson(rng,lam):
-    L=math.exp(-lam); k=0; p=1.0
-    while p>L:
-        k+=1; p*=rng.random()
-    return k-1
-
-def simulate_ml(hr,ar,n,seed):
-    rng=random.Random(seed); hw=aw=0
-    for _ in range(n):
-        h,a=poisson(rng,hr),poisson(rng,ar)
-        hw+=h>a; aw+=a>h
-    ties=max(0,n-hw-aw)
-    return (hw+ties/2)/n,(aw+ties/2)/n
-
-def load_snapshots():
-    try:
-        df=pd.read_csv(SNAPSHOT_FILE)
-    except Exception:
-        return pd.DataFrame()
-    for col in ["commence_time","snapshot_time"]:
-        if col in df:
-            df[col]=pd.to_datetime(df[col],utc=True,errors="coerce")
-    return df
-
-def nearest_pregame_snapshot(snaps, g, target_minutes=90):
-    if snaps.empty:return None
-    subset=snaps[
-        (snaps.home_team.apply(norm)==norm(g["home"])) &
-        (snaps.away_team.apply(norm)==norm(g["away"]))
-    ].copy()
-    if subset.empty:return None
-    game_time=pd.to_datetime(g["gameDate"],utc=True)
-    subset=subset[subset.snapshot_time < game_time]
-    if subset.empty:return None
-    subset["minutes_before"]=(game_time-subset.snapshot_time).dt.total_seconds()/60
-    # Prefer 30-180 minutes pregame, nearest to 90.
-    valid=subset[(subset.minutes_before>=30)&(subset.minutes_before<=180)]
-    if valid.empty:
-        valid=subset
-    valid["distance"]=(valid.minutes_before-target_minutes).abs()
-    return valid.sort_values(["distance","snapshot_time"]).iloc[0]
-
-def build_prospective_dataset(start_date,end_date,sims=1500):
-    snaps=load_snapshots()
-    rows=[]
-    days=(end_date-start_date).days+1
-    prog=st.progress(0)
-    status=st.empty()
-    matched=0
-    for i in range(days):
-        cur=start_date+timedelta(days=i)
-        ds=cur.isoformat()
-        status.write(f"Processing {ds} ({i+1}/{days})")
-        try: gs=games_for(ds)
-        except Exception: gs=[]
-        for g in gs:
-            if g.get("home_score") is None or g.get("away_score") is None:
-                continue
-            snap=nearest_pregame_snapshot(snaps,g)
-            if snap is None:
-                continue
-            try:
-                feat=features_for(g,ds)
-                hr,ar=run_projection(feat)
-                hp,ap=simulate_ml(hr,ar,sims,int(g["gamePk"] or 1))
-            except Exception:
-                continue
-            matched+=1
-            rows.append({
-                "date":ds,
-                "game":f'{g["away"]} @ {g["home"]}',
-                "home_team":g["home"],"away_team":g["away"],
-                "home_outcome":int(g["home_score"]>g["away_score"]),
-                "away_outcome":int(g["away_score"]>g["home_score"]),
-                "home_model_prob":hp,"away_model_prob":ap,
-                "home_market_prob":snap["home_no_vig_prob"],
-                "away_market_prob":snap["away_no_vig_prob"],
-                "home_odds":snap["home_best_odds"],
-                "away_odds":snap["away_best_odds"],
-                "snapshot_time":snap["snapshot_time"],
-                "minutes_before":snap["minutes_before"],
-                **feat
+    allrows=[]
+    for ev in markets:
+        books=ev.get("bookmakers",[])
+        by_player={}
+        best={}
+        for b in books:
+            m=next((m for m in b.get("markets",[]) if m.get("key") in ("outrights","h2h")),None)
+            if not m: continue
+            for o in m.get("outcomes",[]):
+                name=o.get("name"); price=o.get("price")
+                if not name or price is None: continue
+                by_player.setdefault(name,[]).append(american_to_prob(price))
+                if name not in best or float(price)>best[name]["price"]:
+                    best[name]={"price":float(price),"book":b.get("title",b.get("key",""))}
+        if not by_player: continue
+        raw={n:float(np.mean(ps)) for n,ps in by_player.items()}
+        total=sum(raw.values()) or 1
+        novig={n:p/total for n,p in raw.items()}
+        for n,p in sorted(novig.items(), key=lambda x:x[1], reverse=True):
+            allrows.append({
+                "Tournament":ev.get("_sport_title","Golf"),
+                "Player":n,
+                "No-vig market %":p*100,
+                "Best odds":fmt_odds(best[n]["price"]),
+                "Book":best[n]["book"],
+                "Market fair odds":fmt_odds(prob_to_american(p)),
             })
-        prog.progress((i+1)/days)
-    status.empty(); prog.empty()
-    return pd.DataFrame(rows), matched
+    if allrows:
+        st.dataframe(pd.DataFrame(allrows),use_container_width=True,hide_index=True,
+                     column_config={"No-vig market %":st.column_config.NumberColumn(format="%.2f")})
+        st.caption("Golf currently shows market consensus rather than a fake independent 'edge'. A proper PGA betting model needs player-level strokes-gained/form/course-fit inputs. We deliberately do not label market-only differences as a betting edge.")
 
-def to_team_rows(df):
-    rows=[]
-    for _,r in df.iterrows():
-        rows.append({
-            "date":r["date"],"game":r["game"],"team":r["home_team"],"side":"home",
-            "f_off":r["home_off"]-r["away_off"],
-            "f_sp":r["home_sp"]-r["away_sp"],
-            "f_bp":r["home_bp"]-r["away_bp"],
-            "home":1.0,
-            "outcome":r["home_outcome"],
-            "market_prob":r["home_market_prob"],
-            "odds":r["home_odds"],
-        })
-        rows.append({
-            "date":r["date"],"game":r["game"],"team":r["away_team"],"side":"away",
-            "f_off":r["away_off"]-r["home_off"],
-            "f_sp":r["away_sp"]-r["home_sp"],
-            "f_bp":r["away_bp"]-r["home_bp"],
-            "home":0.0,
-            "outcome":r["away_outcome"],
-            "market_prob":r["away_market_prob"],
-            "odds":r["away_odds"],
-        })
-    return pd.DataFrame(rows)
+def snapshot_status():
+    st.subheader("📡 Prospective Market Database")
+    if not DATA_FILE.exists():
+        st.info("No snapshot database is present yet. Run the GitHub Actions collector.")
+        return
+    try:
+        df=pd.read_csv(DATA_FILE)
+    except Exception as e:
+        st.error(str(e)); return
+    if df.empty:
+        st.info("Snapshot file exists but has no rows.")
+        return
+    c1,c2,c3=st.columns(3)
+    c1.metric("Odds observations",len(df))
+    c2.metric("Collection times",df["snapshot_time"].nunique() if "snapshot_time" in df else "—")
+    c3.metric("Unique events",df["event_id"].nunique() if "event_id" in df else "—")
+    if "sport_key" in df:
+        st.dataframe(df.groupby("sport_key").agg(observations=("event_id","size"),events=("event_id","nunique")).reset_index(),hide_index=True,use_container_width=True)
+    st.dataframe(df.tail(100),hide_index=True,use_container_width=True)
 
-FEATURES=["f_off","f_sp","f_bp","home"]
+st.title("📊 EDGE v5 — Multi-Sport Betting Research")
+st.caption("MLB • NFL • NCAA Football • PGA Golf | Current odds + independent football research model + prospective market collection")
 
-def walk_forward(rows,train_days=45,test_days=14,step_days=14):
-    rows=rows.copy()
-    rows["date_dt"]=pd.to_datetime(rows["date"])
-    start,end=rows.date_dt.min(),rows.date_dt.max()
-    outs=[]; cursor=start; wid=0
-    while True:
-        tr0=cursor; tr1=tr0+pd.Timedelta(days=train_days-1)
-        te0=tr1+pd.Timedelta(days=1); te1=te0+pd.Timedelta(days=test_days-1)
-        if te1>end: break
-        train=rows[(rows.date_dt>=tr0)&(rows.date_dt<=tr1)].copy()
-        test=rows[(rows.date_dt>=te0)&(rows.date_dt<=te1)].copy()
-        cursor+=pd.Timedelta(days=step_days)
-        if len(train)<80 or len(test)<20 or train.outcome.nunique()<2: continue
-        wid+=1
-        model=LogisticRegression(C=1.0,solver="lbfgs")
-        model.fit(train[FEATURES].values,train.outcome.astype(int).values)
-        trp=model.predict_proba(train[FEATURES].values)[:,1]
-        tep=model.predict_proba(test[FEATURES].values)[:,1]
-        # Calibrate using training only.
-        p=np.clip(trp,.001,.999)
-        cal=LogisticRegression(C=1e6,solver="lbfgs")
-        cal.fit(np.log(p/(1-p)).reshape(-1,1),train.outcome.astype(int).values)
-        q=np.clip(tep,.001,.999)
-        pred=cal.predict_proba(np.log(q/(1-q)).reshape(-1,1))[:,1]
-        tmp=test.copy()
-        tmp["wf_prob"]=pred
-        tmp["window"]=wid
-        outs.append(tmp)
-    return pd.concat(outs,ignore_index=True) if outs else pd.DataFrame()
+sport=st.sidebar.radio("Sport",["MLB snapshot database","NFL","NCAA Football","PGA Golf"])
+st.sidebar.markdown("---")
+st.sidebar.caption("BET CANDIDATE is a research label, not proof of profitability. Prospective validation remains the standard before increasing stake size.")
 
-def metrics(df,col):
-    p=np.clip(df[col].values,.001,.999)
-    y=df.outcome.astype(int).values
-    return {
-        "brier":float(brier_score_loss(y,p)),
-        "logloss":float(log_loss(y,p,labels=[0,1])),
-        "accuracy":float(((p>=.5).astype(int)==y).mean())
-    }
-
-def roi_table(df):
-    d=df.copy()
-    d["edge"]=(d.wf_prob-d.market_prob)*100
-    d["bet_return"]=np.where(d.outcome==1,d.odds.apply(american_decimal)-1,-1.0)
-    rows=[]
-    for th in [1,2,3,4,5,7.5,10]:
-        b=d[d.edge>=th]
-        if len(b):
-            rows.append({
-                "edge_threshold":th,
-                "bets":len(b),
-                "win_rate":b.outcome.mean(),
-                "roi":b.bet_return.mean(),
-                "avg_edge":b.edge.mean()
-            })
-    return pd.DataFrame(rows)
-
-st.title("📈 EDGE v4.2 — Free Prospective Validation")
-st.caption("No paid historical odds · collect current free odds from now on · build your own benchmark automatically")
-
-tab_status,tab_validate,tab_market,tab_setup=st.tabs(
-    ["📡 Snapshot status","🧪 Prospective test","⚖️ EDGE vs market","⚙️ Free setup"]
-)
-
-with tab_status:
-    snaps=load_snapshots()
-    if snaps.empty:
-        st.warning("No odds snapshots have been collected yet.")
-    else:
-        st.success(f"Snapshots available: {len(snaps):,}")
-        a,b,c=st.columns(3)
-        a.metric("First snapshot",str(snaps.snapshot_time.min()))
-        b.metric("Latest snapshot",str(snaps.snapshot_time.max()))
-        c.metric("Unique games",snaps[["home_team","away_team","commence_time"]].drop_duplicates().shape[0])
-        st.dataframe(snaps.tail(25),use_container_width=True,hide_index=True)
-
-with tab_validate:
-    snaps=load_snapshots()
-    if snaps.empty:
-        st.info("Set up the free GitHub collector first. Once it has accumulated completed games, validation will work here.")
-    else:
-        c1,c2,c3=st.columns(3)
-        default_start=max(date.today()-timedelta(days=60), snaps.snapshot_time.min().date())
-        start=c1.date_input("Start",default_start)
-        end=c2.date_input("End",date.today()-timedelta(days=1))
-        sims=c3.selectbox("Simulations/game",[500,1000,1500,3000],index=1)
-        if st.button("Build prospective validation set",type="primary"):
-            ds,matched=build_prospective_dataset(start,end,sims)
-            st.session_state["prospective_ds"]=ds
-            if matched:
-                st.success(f"Matched {matched} completed games to free pregame snapshots.")
-            else:
-                st.warning("No completed games matched collected snapshots yet.")
-
-        ds=st.session_state.get("prospective_ds")
-        if isinstance(ds,pd.DataFrame) and not ds.empty:
-            st.dataframe(ds.head(20),use_container_width=True,hide_index=True)
-            rows=to_team_rows(ds)
-            if rows.date.nunique() < 30:
-                st.warning("You have less than 30 days of prospective data. Treat any performance numbers as preliminary.")
-            train_days=st.selectbox("Training window",[21,30,45,60],index=1)
-            test_days=st.selectbox("Unseen test window",[7,14,21],index=0)
-            step_days=st.selectbox("Walk step",[7,14],index=0)
-            if st.button("Run prospective walk-forward"):
-                st.session_state["wf"]=walk_forward(rows,train_days,test_days,step_days)
-
-            wf=st.session_state.get("wf")
-            if isinstance(wf,pd.DataFrame) and not wf.empty:
-                em=metrics(wf,"wf_prob")
-                mm=metrics(wf,"market_prob")
-                a,b,c,d=st.columns(4)
-                a.metric("Unseen predictions",len(wf))
-                b.metric("EDGE Brier",f'{em["brier"]:.4f}')
-                c.metric("Market Brier",f'{mm["brier"]:.4f}')
-                d.metric("EDGE accuracy",f'{em["accuracy"]*100:.1f}%')
-
-with tab_market:
-    wf=st.session_state.get("wf")
-    if not isinstance(wf,pd.DataFrame) or wf.empty:
-        st.info("Run the prospective walk-forward test first.")
-    else:
-        em=metrics(wf,"wf_prob")
-        mm=metrics(wf,"market_prob")
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("EDGE Brier",f'{em["brier"]:.4f}')
-        c2.metric("Market Brier",f'{mm["brier"]:.4f}')
-        c3.metric("EDGE log loss",f'{em["logloss"]:.4f}')
-        c4.metric("Market log loss",f'{mm["logloss"]:.4f}')
-        if em["brier"]<mm["brier"]:
-            st.success("EDGE beat the market benchmark on Brier score in this prospective unseen sample.")
-        else:
-            st.warning("EDGE did not beat the market benchmark on Brier score in this prospective unseen sample.")
-        rt=roi_table(wf)
-        if not rt.empty:
-            show=rt.copy()
-            show["win_rate"]=(show.win_rate*100).round(1).astype(str)+"%"
-            show["roi"]=(show.roi*100).round(2).astype(str)+"%"
-            show["avg_edge"]=show.avg_edge.round(2).astype(str)+"%"
-            st.subheader("Flat-stake ROI by minimum EDGE")
-            st.dataframe(show,use_container_width=True,hide_index=True)
-
-with tab_setup:
-    st.subheader("How the free version works")
-    st.write(
-        "GitHub Actions calls the normal CURRENT odds endpoint on a schedule and commits the snapshot CSV "
-        "back into this repository. Current odds are available on The Odds API's free usage plan; the paid "
-        "historical endpoint is no longer used by EDGE v4.2."
-    )
-    st.write(
-        "Because the collector starts now, it cannot magically recreate past sportsbook prices. "
-        "It builds a trustworthy historical benchmark prospectively from this point forward."
-    )
-    st.code(
-        "Required GitHub repository secret:\n"
-        "THE_ODDS_API_KEY = your existing Odds API key\n\n"
-        "Workflow file included:\n"
-        ".github/workflows/collect_odds.yml"
-    )
-    st.info("Once the GitHub Action runs, data/odds_snapshots.csv will begin filling automatically.")
-
-st.caption("EDGE v4.2 — free prospective market validation")
+if sport=="MLB snapshot database":
+    snapshot_status()
+    st.info("Your existing MLB analyzer/collector remains compatible. This v5 database view focuses on the shared prospective odds history.")
+elif sport=="NFL":
+    analyze_football("americanfootball_nfl","NFL","nfl")
+elif sport=="NCAA Football":
+    analyze_football("americanfootball_ncaaf","NCAA Football","college-football")
+else:
+    analyze_golf()
